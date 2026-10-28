@@ -27,6 +27,7 @@ from fastmcp import FastMCP
 from .browser_evaluator import browser_evaluator, package_testcase
 from .build_firefox import build_firefox
 from .build_nss import build_nss
+from .felt.evaluator import felt_browser_evaluator
 from .js_shell_differential_evaluator import js_shell_differential_evaluator
 from .js_shell_evaluator import js_shell_evaluator
 from .nss_gtest_evaluator import nss_gtest_evaluator
@@ -49,10 +50,17 @@ def create_server() -> FastMCP:
     The differential evaluator is only registered when DIFFERENTIAL_ENV is set
     to a non-empty value, so a caller that has not opted into differential
     testing never shows the tool to its agent.
+
+    `felt_browser_evaluator` is registered unconditionally, unlike the
+    differential one. Gating it would mean another environment variable to carry
+    into a sandbox, and the tool already refuses a non-enterprise build with an
+    explanation -- which is better than a tool an agent cannot see on the one
+    checkout where it is the only thing that works.
     """
     server = FastMCP("fx-audit")
     tools: list[Callable[..., object]] = [
         browser_evaluator,
+        felt_browser_evaluator,
         package_testcase,
         js_shell_evaluator,
         build_firefox,

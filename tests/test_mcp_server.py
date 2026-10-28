@@ -10,6 +10,7 @@ from fx_audit_mcp.mcp_server import DIFFERENTIAL_ENV, create_server, main, mcp
 
 EXPECTED_TOOLS = {
     "browser_evaluator",
+    "felt_browser_evaluator",
     "package_testcase",
     "js_shell_evaluator",
     "build_firefox",

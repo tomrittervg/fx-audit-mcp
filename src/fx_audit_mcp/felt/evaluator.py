@@ -221,6 +221,35 @@ def _browser_output(stdout_path: Path, dest: Path) -> Path | None:
     return dest
 
 
+def _require_enterprise_build(firefox_binary: Path) -> None:
+    """Refuse a build that has no Felt to sign in to.
+
+    The mirror of `browser_evaluator`'s guard, which refuses an enterprise build
+    for the opposite reason. Registering this tool unconditionally means an
+    agent on a mozilla-central checkout can reach it, and the failure it would
+    otherwise get -- a sign-in form that never appears -- says nothing useful.
+
+    Args:
+        firefox_binary: The binary about to be launched.
+
+    Raises:
+        RuntimeError: The build is not `--enable-enterprise`.
+    """
+    app_ini = firefox_binary.parent / "application.ini"
+    try:
+        ini = app_ini.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return  # Unpackaged build; cannot classify, so do not guess.
+    if re.search(r"^Name=FirefoxEnterprise\s*$", ini, re.MULTILINE):
+        return
+    raise RuntimeError(
+        f"{firefox_binary} is not a Firefox Enterprise build, so there is no "
+        "Felt sign-in to drive and no console to point it at. Use "
+        "browser_evaluator for a mozilla-central build; this tool exists only "
+        "for targets that need a live enterprise session."
+    )
+
+
 def _free_port(start: int = _FELT_UI_PORT_BASE) -> int:
     """A port nothing is listening on, so two runs cannot collide."""
     import socket
@@ -345,6 +374,7 @@ async def felt_browser_evaluator(  # pragma: no cover
 
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
+    _require_enterprise_build(firefox_binary)
 
     felt_port = _free_port()
     work = Path(tempfile.mkdtemp(prefix="fxe-felt-eval-"))
