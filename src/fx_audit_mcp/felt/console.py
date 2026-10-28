@@ -1,347 +1,184 @@
 #!/usr/bin/env python3
-"""Mock Firefox Enterprise console + SSO, sufficient to establish a Felt session.
+"""Run the fork's own mock enterprise console + SSO servers.
 
-Endpoint contracts reproduced from the fork's own harness
-(`testing/enterprise/felt_tests.py`), not invented. The flow a Felt UI drives:
+This does **not** implement a console. It starts the servers in
+`testing/enterprise/felt_tests.py` -- `ConsoleHttpHandler` and `SsoHttpHandler`,
+driven by that module's `serve()` -- so an audit exercises the same endpoints
+the fork's own browser tests do.
 
-  GET  /sso/login?deviceId=..&version=v2   -> 302 to the login page
-  GET  /sso_url                            -> the login page (a form)
-  GET  /sso/callback                       -> HTML carrying a script#token_data
-                                              blob with one_time_token/user_id/
-                                              email/posture
-  POST /api/browser/sso/token              -> redeem one_time_token (single use)
-                                              or refresh_token -> access/refresh
-  GET  /api/browser/config                 -> unauthenticated; carries extra_prefs
-  GET  /api/browser/key                    -> authed; the SQLite primarySecret
-  GET  /api/browser/policies               -> authed; the policy set
-  GET  /api/browser/whoami                 -> authed; identity
+An earlier version of this file reimplemented those endpoints from reading the
+harness. It worked, eventually, but every blocker took a browser run to
+rediscover something the harness already encoded: that the SSO callback redirect
+must carry a query string, that `/auth` has to set a cookie or Felt refuses to
+spawn the browser, and that the cookie's Domain has to match the host actually
+used. Reproducing a protocol whose sequencing is undocumented is how those get
+lost; running the real thing is how they stay fixed.
 
-Every request is journalled so a run can be inspected afterwards.
+The servers need `requests`, `marionette_driver` and `mozprofile`, which
+fx-audit-mcp does not depend on, so they run under the checkout's
+`mach python` in a subprocess. Only the ports come back.
+
+What this relies on is written down next to the servers themselves, in
+`testing/enterprise/CONSOLE_CONTRACT.md`, so a change there is visible to
+whoever makes it.
 """
 
 from __future__ import annotations
 
-import argparse
-import base64
 import json
-import secrets
+import subprocess
 import sys
-import threading
 import time
-import urllib.parse
-import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from tempfile import TemporaryDirectory
 
-PRIMARY_SECRET = secrets.token_hex(32)
-# The SSO cookie Felt requires. FeltProcessParent throws "Not enough cookies!!"
-# and never spawns the browser if the sign-in flow set none, so this is
-# load-bearing rather than decoration.
-COOKIE_NAME = "fxe_sso_" + secrets.token_hex(4)
-COOKIE_VALUE = secrets.token_hex(8)
-USER_ID = "8f14e45f-ceea-467d-9a3e-000000000042"
-EMAIL = "nobody@mozilla.org"
-
-_LOCK = threading.Lock()
-
-
-class State:
-    one_time_token: str | None = None
-    access_token: str = ""
-    refresh_token: str = ""
-    policies: ClassVar[dict] = {}
+LAUNCHER = Path(__file__).with_name("console_launcher.py")
+# Generous on purpose, but not for the reason first assumed. `mach python` does
+# create its `common` virtualenv on first use, which looked like it could
+# dominate this; measured 2026-10-28 it is ~1.6s and needs no network, because
+# the venv is empty and a generated mach.pth points at in-tree code -- requests
+# is vendored at third_party/python/requests, marionette_driver and mozprofile
+# live under testing/. What this timeout actually covers is a cold `mach`
+# itself on a checkout whose build state has to be re-read.
+BIND_TIMEOUT_S = 180.0
 
 
-STATE = State()
+@dataclass(frozen=True)
+class ConsoleEndpoints:
+    """Where the running servers are, and the cookie the SSO server will set."""
+
+    console_url: str
+    sso_url: str
+    cookie_name: str
+    cookie_value: str
 
 
-def _posture() -> dict:
-    """Minimal posture descriptor; the console folds this into token replies."""
-    return {"edr_agents": [], "disk_encryption": [], "os_version": []}
+class FeltConsole:
+    """The fork's mock console and SSO servers, as a context manager.
 
+    Args:
+        firefox_root: The Firefox Enterprise checkout. Must contain `mach` and
+            `testing/enterprise/felt_tests.py`.
+    """
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "MockEnterpriseConsole/0"
+    def __init__(self, firefox_root: Path):
+        self._root = Path(firefox_root)
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._tmp: TemporaryDirectory[str] | None = None
+        self.endpoints: ConsoleEndpoints | None = None
 
-    # -- plumbing ---------------------------------------------------------
+    def __enter__(self) -> ConsoleEndpoints:
+        return self.start()
 
-    def _journal(self, method: str, body: bytes) -> None:
-        entry = {
-            "t": round(time.time(), 3),
-            "method": method,
-            "path": self.path,
-            "authorization": self.headers.get("Authorization", ""),
-            "body": body.decode("utf-8", errors="replace")[:2000],
-        }
-        with _LOCK, Path(self.server.journal).open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
-        print(f"[console] {method} {self.path}", file=sys.stderr, flush=True)
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
 
-    def _send(
-        self, body: bytes, code: int = 200, ctype: str = "application/json"
-    ) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def start(self) -> ConsoleEndpoints:
+        """Launch both servers and block until each has bound a port.
 
-    def _json(self, obj: object, code: int = 200) -> None:
-        self._send(json.dumps(obj).encode(), code)
+        Returns:
+            Where the servers are listening, and the SSO cookie identity.
 
-    def _authed(self) -> bool:
-        """Accept any Bearer token we have issued. Deliberately permissive."""
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and STATE.access_token:
-            return True
-        self._send(b"", 401, "text/plain")
-        return False
+        Raises:
+            FileNotFoundError: The checkout has no `mach` or no harness.
+            RuntimeError: The servers exited or failed to bind in time.
+        """
+        mach = self._root / "mach"
+        harness = self._root / "testing" / "enterprise" / "felt_tests.py"
+        for path, what in ((mach, "mach"), (harness, "the enterprise test harness")):
+            if not path.exists():
+                raise FileNotFoundError(f"{self._root} has no {what} at {path}")
 
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Silenced; _journal already records every request."""
+        self._tmp = TemporaryDirectory(prefix="fxe-console-")
+        port_file = Path(self._tmp.name) / "ports.json"
 
-    # -- routes -----------------------------------------------------------
+        # PYTHONPATH carries testing/enterprise so felt_tests can find its
+        # siblings (base_test, felt_consts); mach python supplies the rest.
+        self._proc = subprocess.Popen(
+            [str(mach), "python", str(LAUNCHER), "--port-file", str(port_file)],
+            cwd=self._root,
+            env={**_inherited_env(), "PYTHONPATH": "testing/enterprise"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
 
-    def do_GET(self) -> None:
-        self._journal("GET", b"")
-        parsed = urllib.parse.urlparse(self.path)
-        path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
-        port = self.server.server_address[1]
+        deadline = time.time() + BIND_TIMEOUT_S
+        while time.time() < deadline:
+            if port_file.exists():
+                data = json.loads(port_file.read_text(encoding="utf-8"))
+                self.endpoints = ConsoleEndpoints(
+                    console_url=f"http://127.0.0.1:{data['console_port']}",
+                    sso_url=f"http://127.0.0.1:{data['sso_port']}",
+                    cookie_name=data["cookie_name"],
+                    cookie_value=data["cookie_value"],
+                )
+                return self.endpoints
+            if self._proc.poll() is not None:
+                err = (self._proc.stderr.read() if self._proc.stderr else b"").decode(
+                    "utf-8", errors="replace"
+                )
+                raise RuntimeError(
+                    f"the console servers exited before binding (rc="
+                    f"{self._proc.returncode}):\n{err}"
+                )
+            time.sleep(0.2)
 
-        if path == "/sso/login":
-            # The client must identify the device and ask for v2; the harness
-            # rejects anything else, so reproduce that rather than being lax.
-            if "deviceId" not in query or query.get("version") != ["v2"]:
-                self._send(b"", 403, "text/plain")
-                return
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{port}/sso_url")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+        self.stop()
+        raise RuntimeError(
+            f"the console servers did not bind within {BIND_TIMEOUT_S:.0f}s."
+            " The servers bind port 0 and write the result back, so this means"
+            " `mach python` itself never got far enough to import felt_tests --"
+            " check that the checkout builds and that testing/enterprise is on"
+            " PYTHONPATH."
+        )
 
-        if path == "/sso_url":
-            # Stand-in for the identity provider. A real IdP that already has a
-            # session for the user redirects straight back to the callback
-            # rather than presenting a form, so do that: it keeps the number of
-            # UI interactions the harness has to drive at exactly one (the Felt
-            # sign-in button), instead of two.
-            # The query string is load-bearing, not decoration. The FeltWindow
-            # actor matches on ConsoleClient.ssoCallbackUriMatchPattern, which is
-            # `<console>/sso/callback` with the port stripped and "?*" appended;
-            # a WebExtensions MatchPattern of that shape does not match a URL
-            # with no query at all, so the actor never attaches, DOMContentLoaded
-            # is never handled and the one-time token is never scraped. The
-            # fork's own harness redirects to "?foo" for this reason.
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{port}/auth")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        if path == "/auth":
-            # Sets the SSO cookie and continues to the callback. Felt collects
-            # cookies from the sign-in browsing context after the callback and
-            # refuses to spawn the browser when it finds none, so this hop
-            # cannot be skipped by redirecting straight to the callback.
-            #
-            # No Domain attribute: the fork's own harness sends
-            # `Domain=localhost`, which would not apply to a 127.0.0.1 request.
-            # Host-only is correct for whichever host actually served this.
-            expires = time.strftime(
-                "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() + 8 * 3600)
-            )
-            self.send_response(302)
-            self.send_header(
-                "Set-Cookie",
-                f"{COOKIE_NAME}={COOKIE_VALUE}; Path=/; "
-                f"Expires={expires}; SameSite=Strict",
-            )
-            self.send_header("Location", f"http://127.0.0.1:{port}/sso/callback?auth=1")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        if path == "/sso/callback":
-            STATE.one_time_token = str(uuid.uuid4())
-            blob = json.dumps(
-                {
-                    "one_time_token": STATE.one_time_token,
-                    "user_id": USER_ID,
-                    "email": EMAIL,
-                    "posture": _posture(),
-                }
-            )
-            self._send(
-                f"""<html><head><title>Callback!</title>
-                <script id="token_data" type="application/json">{blob}</script>
-                </head><body><h1>Welcome!</h1></body></html>""".encode(),
-                ctype="text/html",
-            )
-            return
-
-        if path == "/api/browser/config":
-            self._json(
-                {
-                    "learn_more_url": "",
-                    "company_logo_url": "",
-                    "policies": {"polling_frequency": 500},
-                    "services": {
-                        "push_url": "",
-                        "remote_settings_url": "",
-                        "tokenserver_url": "",
-                    },
-                    # marionette.port 0 lets the spawned browser pick a free port,
-                    # so Felt UI and browser can both run Marionette at once.
-                    "extra_prefs": [
-                        ["marionette.port", 0],
-                        ["telemetry.fog.init_on_shutdown", False],
-                    ],
-                }
-            )
-            return
-
-        if path == "/api/browser/key":
-            if not self._authed():
-                return
-            self._json({"data": PRIMARY_SECRET})
-            return
-
-        if path == "/api/browser/policies":
-            if not self._authed():
-                return
-            self._json(STATE.policies)
-            return
-
-        if path == "/api/browser/whoami":
-            if not self._authed():
-                return
-            self._json(
-                {
-                    "id": USER_ID,
-                    "email": EMAIL,
-                    "name": "moz user",
-                    "picture": "",
-                    "is_active": True,
-                    "last_login_at": "2025-11-14T14:27:23.575030Z",
-                    "created_at": "2025-10-31T15:11:50.735175Z",
-                    "updated_at": "2025-11-14T14:27:23.602803Z",
-                    "policy_roles_id": None,
-                }
-            )
-            return
-
-        if path.startswith("/api/browser/updates"):
-            self._send(b'<?xml version="1.0"?><updates></updates>', ctype="text/xml")
-            return
-
-        if path == "/api/browser/forced_updates_count":
-            self._json({"count": 0})
-            return
-
-        if path.startswith("/sso/get_device_posture"):
-            self._json(_posture())
-            return
-
-        if path == "/sso/get_sso_os_version":
-            self._json({"os_version": ""})
-            return
-
-        if path == "/api/v1/fpn/token":
-            now = int(time.time())
-            body = {
-                "sub": "test",
-                "aud": f"http://127.0.0.1:{port}",
-                "iat": now,
-                "nbf": now,
-                "exp": now + 3600,
-                "iss": "test",
-            }
-            enc = base64.b64encode(json.dumps(body).encode()).decode()
-            self._json({"token": f"fxn.{enc}.token"})
-            return
-
-        self._json({}, 404)
-
-    def do_POST(self) -> None:
-        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        self._journal("POST", body)
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == "/api/browser/sso/token":
+    def stop(self) -> None:
+        """Terminate the servers; safe to call more than once."""
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
             try:
-                payload = json.loads(body or b"{}")
-            except ValueError:
-                self._send(b"", 400, "text/plain")
-                return
-            grant = payload.get("grant_type")
-            if grant == "one_time_token":
-                if payload.get("one_time_token") != STATE.one_time_token:
-                    self._send(b"", 401, "text/plain")
-                    return
-                STATE.one_time_token = None  # single use
-            elif grant == "refresh_token":
-                if payload.get("refresh_token") != STATE.refresh_token:
-                    self._send(b"", 401, "text/plain")
-                    return
-            else:
-                self._send(b"", 401, "text/plain")
-                return
-            STATE.access_token = str(uuid.uuid4())
-            STATE.refresh_token = str(uuid.uuid4())
-            self._json(
-                {
-                    "access_token": STATE.access_token,
-                    "token_type": "Bearer",
-                    "expires_in": 71999,
-                    "refresh_token": STATE.refresh_token,
-                    "posture": _posture(),
-                }
-            )
-            return
+                self._proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+        if self._tmp is not None:
+            self._tmp.cleanup()
+            self._tmp = None
 
-        if path == "/api/browser/policies":
-            if not self._authed():
-                return
-            self._json(STATE.policies)
-            return
 
-        self._json({}, 404)
+def _inherited_env() -> dict[str, str]:
+    """The environment to hand mach, minus anything that would mislead it."""
+    import os
 
-    def do_PUT(self) -> None:
-        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        self._journal("PUT", body)
-        self._json({})
+    env = dict(os.environ)
+    # The console is being started so a *real* Felt session can run; a bypass
+    # inherited from the caller would defeat that, and the fork's own harness
+    # deletes it for the same reason.
+    env.pop("MOZ_BYPASS_FELT", None)
+    return env
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--journal", type=Path, required=True)
-    ap.add_argument("--port-file", type=Path, required=True)
-    ap.add_argument(
-        "--policies",
-        type=Path,
-        default=None,
-        help="JSON file with the policy set to serve",
-    )
+    """Run the servers in the foreground, for manual use."""
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("firefox_root", type=Path)
     args = ap.parse_args()
 
-    if args.policies and args.policies.exists():
-        STATE.policies = json.loads(args.policies.read_text())
-
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    httpd.journal = args.journal  # type: ignore[attr-defined]
-    port = httpd.server_address[1]
-    args.port_file.write_text(str(port), encoding="utf-8")
-    print(f"[console] listening on 127.0.0.1:{port}", file=sys.stderr, flush=True)
-    print(f"[console] primarySecret={PRIMARY_SECRET}", file=sys.stderr, flush=True)
-    print(
-        f"[console] ssoCookie={COOKIE_NAME}={COOKIE_VALUE}", file=sys.stderr, flush=True
-    )
-    httpd.serve_forever()
-    return 0
+    console = FeltConsole(args.firefox_root)
+    endpoints = console.start()
+    print(f"MOZ_ENTERPRISE_CONSOLE_URL={endpoints.console_url}")
+    print(f"sso={endpoints.sso_url}")
+    print(f"cookie={endpoints.cookie_name}={endpoints.cookie_value}")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        console.stop()
 
 
 if __name__ == "__main__":
