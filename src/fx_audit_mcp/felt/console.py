@@ -62,8 +62,9 @@ class FeltConsole:
             `testing/enterprise/felt_tests.py`.
     """
 
-    def __init__(self, firefox_root: Path):
+    def __init__(self, firefox_root: Path, log_path: Path | None = None):
         self._root = Path(firefox_root)
+        self._log_path = log_path
         self._proc: subprocess.Popen[bytes] | None = None
         self._tmp: TemporaryDirectory[str] | None = None
         self.endpoints: ConsoleEndpoints | None = None
@@ -100,16 +101,29 @@ class FeltConsole:
             cwd=self._root,
             env={**_inherited_env(), "PYTHONPATH": "testing/enterprise"},
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            # BaseHTTPRequestHandler logs every request here and the harness does
+            # not silence it, so this is the server-side request log. Keeping it
+            # is what makes a failed handshake diagnosable from the other end --
+            # a 401 on token redemption looks identical in the browser whether
+            # the callback was never served or the token was already spent.
+            stderr=(self._log_path.open("wb") if self._log_path else subprocess.PIPE),
         )
 
         deadline = time.time() + BIND_TIMEOUT_S
         while time.time() < deadline:
             if port_file.exists():
                 data = json.loads(port_file.read_text(encoding="utf-8"))
+                # `localhost`, not `127.0.0.1`. The handlers build every
+                # internal link as `http://localhost:<port>/...` and set the
+                # sign-in cookie with `Domain=localhost`. Point the browser at
+                # 127.0.0.1 and two things break at once: the cookie does not
+                # apply, and the FeltWindow actor's match pattern -- derived
+                # from the console address -- cannot match a callback served
+                # from a different hostname, so the one-time token is never
+                # scraped. See CONSOLE_CONTRACT.md in the fork.
                 self.endpoints = ConsoleEndpoints(
-                    console_url=f"http://127.0.0.1:{data['console_port']}",
-                    sso_url=f"http://127.0.0.1:{data['sso_port']}",
+                    console_url=f"http://localhost:{data['console_port']}",
+                    sso_url=f"http://localhost:{data['sso_port']}",
                     cookie_name=data["cookie_name"],
                     cookie_value=data["cookie_value"],
                 )
