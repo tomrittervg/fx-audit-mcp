@@ -281,6 +281,67 @@ def _load_pref_blocklist() -> list[str]:
     ]
 
 
+def _check_felt_launch(firefox_binary: Path) -> None:
+    """Refuse a Firefox Enterprise build that would come up as the Felt UI.
+
+    A bare launch of an ``--enable-enterprise`` build starts the Felt sign-in UI
+    rather than a browser. The process starts and opens a window, so the launch
+    itself looks healthy; what never happens is the testcase being fetched. The
+    result is a run that burns its launch timeout and reports no crash, which is
+    indistinguishable in the output from a testcase that genuinely did not
+    reproduce -- a false clean result, and the one failure mode an audit cannot
+    afford to absorb silently.
+
+    ``MOZ_BYPASS_FELT`` makes the browser UI come up directly, and is accepted
+    here as an override. It is **not** the general remedy: the bypass does not
+    merely skip the sign-in screen, it produces a browser the fork's own surface
+    is missing from. `ActorManagerParent.sys.mjs` registers the Felt actors
+    under ``Services.felt?.isFeltUI()``, which the bypass makes false, so those
+    actors are never registered at all; console-delivered policy, SSO tokens,
+    the SQLite data-encryption keys and the Felt IPC channel are likewise
+    absent. A clean result from a bypassed browser is evidence only for code
+    with no session dependency -- fork-modified shared code. For anything that
+    needs a session, the browser has to be the one a real Felt sign-in spawns.
+
+    The bypass is honoured only on a ``default``-update-channel build, which is
+    what the enterprise mozconfigs produce, so it is inert on anything
+    shippable.
+
+    Args:
+        firefox_binary: The binary about to be launched.
+
+    Raises:
+        RuntimeError: The binary is an enterprise build and no Felt bypass is
+            in the environment.
+    """
+    if os.environ.get("MOZ_BYPASS_FELT"):
+        return
+    app_ini = firefox_binary.parent / "application.ini"
+    try:
+        ini = app_ini.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # No application.ini next to the binary: not a packaged build we can
+        # identify, so say nothing rather than guess.
+        return
+    if not re.search(r"^Name=FirefoxEnterprise\s*$", ini, re.MULTILINE):
+        return
+    raise RuntimeError(
+        f"{firefox_binary} is a Firefox Enterprise build, which launches the "
+        "Felt sign-in UI instead of a browser. The testcase would never be "
+        "fetched and the run would report no crash regardless of what the "
+        "testcase does.\n"
+        "Run the testcase in the browser a real Felt sign-in spawns: stand up a "
+        "mock console, point MOZ_ENTERPRISE_CONSOLE_URL at it, complete the "
+        "sign-in, and drive the child browser.\n"
+        "MOZ_BYPASS_FELT=1 overrides this check, but it is only valid for "
+        "fork-modified shared code. It makes Services.felt.isFeltUI() false, so "
+        "ActorManagerParent never registers the Felt actors, and there is no "
+        "console policy, no SSO token, no SQLite DEK and no Felt IPC channel. "
+        "On a target that depends on any of those, a bypassed browser does not "
+        "run the code under test and a clean result means nothing."
+    )
+
+
 def _build_testcase(file_paths: dict[str, Path], entry_point: str) -> TestCase:
     """Build a grizzly TestCase from files on disk.
 
@@ -480,6 +541,7 @@ async def browser_evaluator(  # pragma: no cover
     """
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
+    _check_felt_launch(firefox_binary)
 
     testcase = _build_testcase(file_paths, entry_point)
 

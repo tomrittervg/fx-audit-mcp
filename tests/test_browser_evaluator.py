@@ -19,6 +19,7 @@ from fx_audit_mcp.browser_evaluator import (
     PREF_BLOCKLIST_ENV,
     _build_testcase,
     _categorize_logs,
+    _check_felt_launch,
     _check_pref_blocklist,
     _crashed_process_fields,
     _extract_child_ptypes,
@@ -181,6 +182,75 @@ class TestCheckPrefBlocklist:
         assert "dom.workers.enabled" in message
         assert "geo.enabled" in message
         assert "media.gmp.enabled" not in message
+
+
+class TestCheckFeltLaunch:
+    """The guard that refuses a build which would come up as the Felt UI."""
+
+    BYPASS_ENV = "MOZ_BYPASS_FELT"
+
+    @staticmethod
+    def _build(tmp_path: Path, name: str | None) -> Path:
+        """A binary with an application.ini declaring *name*, or none at all."""
+        binary = tmp_path / "firefox"
+        binary.touch()
+        if name is not None:
+            (tmp_path / "application.ini").write_text(
+                f"[App]\nVendor=Mozilla\nName={name}\nVersion=161.0a1\n"
+            )
+        return binary
+
+    def test_enterprise_without_bypass_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An enterprise build with no bypass is refused, not launched."""
+        monkeypatch.delenv(self.BYPASS_ENV, raising=False)
+        binary = self._build(tmp_path, "FirefoxEnterprise")
+        with pytest.raises(RuntimeError) as exc_info:
+            _check_felt_launch(binary)
+        message = str(exc_info.value)
+        # The remedy order matters: a real session first, the bypass as the
+        # narrow case, since a bypassed browser does not register the Felt
+        # actors at all.
+        assert "Felt sign-in UI" in message
+        assert "MOZ_ENTERPRISE_CONSOLE_URL" in message
+        assert self.BYPASS_ENV in message
+
+    def test_enterprise_with_bypass_allowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bypass is accepted as an explicit override."""
+        monkeypatch.setenv(self.BYPASS_ENV, "1")
+        assert _check_felt_launch(self._build(tmp_path, "FirefoxEnterprise")) is None
+
+    def test_non_enterprise_passes_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stock Firefox build is unaffected."""
+        monkeypatch.delenv(self.BYPASS_ENV, raising=False)
+        assert _check_felt_launch(self._build(tmp_path, "Firefox")) is None
+
+    def test_missing_application_ini_passes_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unpackaged build cannot be classified, so it is not refused.
+
+        Guessing here would break callers that work today.
+        """
+        monkeypatch.delenv(self.BYPASS_ENV, raising=False)
+        assert _check_felt_launch(self._build(tmp_path, None)) is None
+
+    def test_name_match_is_anchored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a whole-line Name= match counts, not a substring elsewhere."""
+        monkeypatch.delenv(self.BYPASS_ENV, raising=False)
+        binary = tmp_path / "firefox"
+        binary.touch()
+        (tmp_path / "application.ini").write_text(
+            "[App]\nName=Firefox\nRemotingName=FirefoxEnterprise\n"
+        )
+        assert _check_felt_launch(binary) is None
 
 
 class TestLoadPrefBlocklist:
