@@ -14,6 +14,10 @@ Two additions, both of which the stock handler cannot express:
 - `extra_prefs` in the config response, which the stock handler hardcodes.
   It is the only way a pref reaches the browser Felt spawns, because Felt
   chooses that browser's profile.
+- extra entries in the policy response, which the stock handler renders from
+  a fixed menu of `policy_*` toggles. SitePolicies and DataLossPrevention
+  have no toggle, so without this a target gated on either cannot be reached
+  at all -- the gap an audit run hit on `SitePolicyUtils.sys.mjs`.
 
 Deliberately a subclass. Every other endpoint, and the entire session
 handshake, stays the fork's own code -- the point of running their servers
@@ -31,11 +35,14 @@ from pathlib import Path
 
 from console_patch import (  # type: ignore[import-not-found]
     DLP_WASM_ENV,
+    POLICIES_ENV,
     PREFS_ENV,
+    inject_extra_policies,
     inject_extra_prefs,
     parse_prefs_env,
     wants_config,
     wants_dlp_wasm,
+    wants_policies,
 )
 from felt_tests import ConsoleHttpHandler  # type: ignore[import-not-found]
 
@@ -57,16 +64,22 @@ class AuditConsoleHandler(ConsoleHttpHandler):  # type: ignore[misc]
         status: str = "Success",
         contentType: str | None = None,  # noqa: N803 - the fork's spelling
     ) -> None:
-        """Add the run's prefs on the way out of the config endpoint.
+        """Add the run's prefs and policies on the way out.
 
         Overriding the shared reply helper rather than reimplementing
-        `/api/browser/config` keeps the fork responsible for the rest of that
-        response, which is most of what makes a session work.
+        `/api/browser/config` and `/api/browser/policies` keeps the fork
+        responsible for the rest of those responses, which is most of what
+        makes a session work.
         """
-        if wants_config(self.path) and code == 200:
-            payload = inject_extra_prefs(
-                payload, parse_prefs_env(os.environ.get(PREFS_ENV))
-            )
+        if code == 200:
+            if wants_config(self.path):
+                payload = inject_extra_prefs(
+                    payload, parse_prefs_env(os.environ.get(PREFS_ENV))
+                )
+            elif wants_policies(self.path):
+                payload = inject_extra_policies(
+                    payload, parse_prefs_env(os.environ.get(POLICIES_ENV))
+                )
         super().reply(payload, code, status, contentType)
 
     def _serve_dlp_wasm(self) -> None:

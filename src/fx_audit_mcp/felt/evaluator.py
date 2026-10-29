@@ -350,6 +350,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     timeout: int = 120,
     email: str = "nobody@mozilla.org",
     prefs: dict[str, str | int | bool] | None = None,
+    policies: dict[str, object] | None = None,
     dlp_wasm: Path | None = None,
     enable_sandbox: bool = False,
 ) -> BrowserCrashInfo:
@@ -399,6 +400,18 @@ async def felt_browser_evaluator(  # pragma: no cover
             `FIREFOX_PREF_BLOCKLIST` file exactly as `browser_evaluator`
             checks its prefs.js; a match raises ValueError before anything
             launches, and the caller cannot disable the guard.
+        policies: Enterprise policies for the spawned browser, merged into the
+            console's `/api/browser/policies` response as policy name ->
+            value. The stock mock console renders a fixed menu --
+            BlockAboutConfig, AccessConnector, ExtensionSettings,
+            DisableSafeMode, Watermark, SignOut -- and has no toggle for
+            SitePolicies or DataLossPrevention, so a target gated on one of
+            those is unreachable without this. Unlike `prefs`, a value here
+            replaces one the fork sent: those come from toggles and are
+            defaults, and nothing in the session handshake depends on them.
+            Delivered over the Felt session like every other policy, so the
+            code under test sees a policy that arrived the way a real one
+            does. Recorded in `log_stdout_session.txt`.
         dlp_wasm: WebAssembly module to answer the DLP module fetch with.
             Defaults to the fork's own test double under
             `toolkit/components/contentanalysis/tests/`, which the stock mock
@@ -477,6 +490,7 @@ async def felt_browser_evaluator(  # pragma: no cover
         firefox_root,
         log_path=log_dir / "log_console.txt",
         extra_prefs=prefs or {},
+        extra_policies=policies or {},
         dlp_wasm=wasm,
     )
     server = _TestcaseServer(testcase_dir, log_dir / "log_stdout_requests.txt")
@@ -654,6 +668,7 @@ async def felt_browser_evaluator(  # pragma: no cover
         f"loaded_uri: {loaded_uri}\n"
         f"remote_type: {remote_type}\n"
         f"extra_prefs: {sorted((prefs or {}).items())}\n"
+        f"extra_policies: {sorted(policies or {})}\n"
         f"dlp_wasm_served: {wasm}\n"
         f"enable_sandbox: {enable_sandbox}\n"
         "note: remote_type is the spawned browser's selectedBrowser.remoteType\n"

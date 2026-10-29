@@ -9,10 +9,13 @@ import json
 
 from fx_audit_mcp.felt.console_patch import (
     CONFIG_PATH,
+    POLICIES_PATH,
+    inject_extra_policies,
     inject_extra_prefs,
     parse_prefs_env,
     wants_config,
     wants_dlp_wasm,
+    wants_policies,
 )
 
 # The shape the fork sends, reduced to the field that matters.
@@ -80,3 +83,60 @@ class TestParsePrefsEnv:
         traceback surfaces as an unexplained 500."""
         for raw in (None, "", "not json", "[1,2]", "null"):
             assert parse_prefs_env(raw) == {}
+
+
+STOCK_POLICIES = json.dumps(
+    {
+        "policies": {"BlockAboutConfig": True, "DisableSafeMode": False},
+        "relaunch": {"delay": 5},
+    }
+)
+
+
+class TestInjectExtraPolicies:
+    def test_adds_a_policy_the_fork_cannot_express(self) -> None:
+        """SitePolicies has no policy_* toggle; this is its only route."""
+        site = {"Rules": [{"Match": ["https://example.com/*"], "Block": True}]}
+        out = json.loads(inject_extra_policies(STOCK_POLICIES, {"SitePolicies": site}))
+        assert out["policies"]["SitePolicies"] == site
+
+    def test_keeps_the_forks_own_policies(self) -> None:
+        out = json.loads(inject_extra_policies(STOCK_POLICIES, {"SitePolicies": {}}))
+        assert out["policies"]["BlockAboutConfig"] is True
+        assert out["policies"]["DisableSafeMode"] is False
+
+    def test_leaves_relaunch_alone(self) -> None:
+        """relaunch is a sibling of policies, not one of them."""
+        out = json.loads(inject_extra_policies(STOCK_POLICIES, {"Watermark": {}}))
+        assert out["relaunch"] == {"delay": 5}
+
+    def test_may_replace_a_policy_the_fork_sent(self) -> None:
+        """Unlike prefs: a target whose subject is Watermark must set its own.
+
+        The fork's values come from toggles and are defaults; no part of the
+        session handshake reads them.
+        """
+        out = json.loads(
+            inject_extra_policies(STOCK_POLICIES, {"BlockAboutConfig": False})
+        )
+        assert out["policies"]["BlockAboutConfig"] is False
+
+    def test_no_policies_is_byte_identical(self) -> None:
+        assert inject_extra_policies(STOCK_POLICIES, {}) == STOCK_POLICIES
+
+    def test_unrecognised_payload_is_passed_through(self) -> None:
+        for payload in ("not json", "[]", json.dumps({"no_policies": 1})):
+            assert inject_extra_policies(payload, {"x": 1}) == payload
+
+
+class TestPolicyPathMatching:
+    def test_matches_with_and_without_query(self) -> None:
+        assert wants_policies(POLICIES_PATH)
+        assert wants_policies(f"{POLICIES_PATH}?v=2")
+        assert not wants_policies("/api/browser/policies/extra")
+        assert not wants_policies(CONFIG_PATH)
+
+    def test_config_and_policies_do_not_collide(self) -> None:
+        """reply() dispatches on these two; an overlap would inject the wrong body."""
+        assert not wants_config(POLICIES_PATH)
+        assert not wants_policies(CONFIG_PATH)
