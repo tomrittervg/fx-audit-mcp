@@ -32,6 +32,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+from .console_patch import DLP_WASM_ENV, PREFS_ENV
 
 LAUNCHER = Path(__file__).with_name("console_launcher.py")
 # Generous on purpose, but not for the reason first assumed. `mach python` does
@@ -62,9 +68,17 @@ class FeltConsole:
             `testing/enterprise/felt_tests.py`.
     """
 
-    def __init__(self, firefox_root: Path, log_path: Path | None = None):
+    def __init__(
+        self,
+        firefox_root: Path,
+        log_path: Path | None = None,
+        extra_prefs: Mapping[str, object] | None = None,
+        dlp_wasm: Path | None = None,
+    ):
         self._root = Path(firefox_root)
         self._log_path = log_path
+        self._extra_prefs = dict(extra_prefs or {})
+        self._dlp_wasm = dlp_wasm
         self._proc: subprocess.Popen[bytes] | None = None
         self._tmp: TemporaryDirectory[str] | None = None
         self.endpoints: ConsoleEndpoints | None = None
@@ -99,7 +113,18 @@ class FeltConsole:
         self._proc = subprocess.Popen(
             [str(mach), "python", str(LAUNCHER), "--port-file", str(port_file)],
             cwd=self._root,
-            env={**_inherited_env(), "PYTHONPATH": "testing/enterprise"},
+            env={
+                **_inherited_env(),
+                "PYTHONPATH": "testing/enterprise",
+                # Read by audit_handler inside the server processes. Env rather
+                # than arguments because the handler class crosses a
+                # multiprocessing.Process boundary and a forkserver or spawn
+                # start method would re-import it, losing anything held on the
+                # class. A pref that silently fails to apply is the exact
+                # failure this delivery path exists to fix.
+                PREFS_ENV: json.dumps(self._extra_prefs),
+                **({DLP_WASM_ENV: str(self._dlp_wasm)} if self._dlp_wasm else {}),
+            },
             stdout=subprocess.DEVNULL,
             # BaseHTTPRequestHandler logs every request here and the harness does
             # not silence it, so this is the server-side request log. Keeping it

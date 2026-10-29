@@ -29,9 +29,23 @@ def main() -> int:
     ap.add_argument("--port-file", required=True, type=Path)
     args = ap.parse_args()
 
+    # This file runs as a script under `mach python`, so its own directory is
+    # not importable by default. audit_handler and console_patch live beside
+    # it, and audit_handler must be importable *by name* rather than only
+    # present, because the class it defines is handed to Process.
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
     # Imported here, not at module scope: this only resolves under mach python.
+    # Subclasses ConsoleHttpHandler to add the DLP WebAssembly route the stock
+    # console answers with 404, and to inject the run's prefs into
+    # /api/browser/config -- the only path by which a pref reaches the browser
+    # Felt spawns. Imported from this directory, which main() puts on sys.path,
+    # so the class has a qualified name and survives being handed to Process
+    # under any start method.
+    from audit_handler import AuditConsoleHandler  # type: ignore[import-not-found]
     from felt_tests import (  # type: ignore[import-not-found]
-        ConsoleHttpHandler,
         SharedString,
         SsoHttpHandler,
         serve,
@@ -72,7 +86,7 @@ def main() -> int:
 
     console = Process(
         target=serve,
-        args=(ConsoleHttpHandler,),
+        args=(AuditConsoleHandler,),
         kwargs={
             "sso_port": sso_port,
             "console_port": console_port,

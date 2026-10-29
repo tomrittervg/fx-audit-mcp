@@ -221,6 +221,26 @@ def _browser_output(stdout_path: Path, dest: Path) -> Path | None:
     return dest
 
 
+def _default_dlp_wasm(firefox_root: Path) -> Path | None:
+    """The fork's own DLP WebAssembly test double, if the checkout has it.
+
+    Returns None when absent rather than raising: a run whose target has
+    nothing to do with content analysis should not fail over a missing test
+    artifact, and the handler answers 404 in that case, which is exactly what
+    the stock console does.
+    """
+    candidate = (
+        firefox_root
+        / "toolkit"
+        / "components"
+        / "contentanalysis"
+        / "tests"
+        / "xpcshell"
+        / "content_analysis_wasm.wasm"
+    )
+    return candidate if candidate.is_file() else None
+
+
 def _require_enterprise_build(firefox_binary: Path) -> None:
     """Refuse a build that has no Felt to sign in to.
 
@@ -248,6 +268,30 @@ def _require_enterprise_build(firefox_binary: Path) -> None:
         "browser_evaluator for a mozilla-central build; this tool exists only "
         "for targets that need a live enterprise session."
     )
+
+
+def _reject_blocked_prefs(prefs: dict[str, str | int | bool] | None) -> None:
+    """Refuse caller prefs named by the FIREFOX_PREF_BLOCKLIST file.
+
+    `browser_evaluator` checks the generated prefs.js; this tool never writes
+    one -- prefs ride to the spawned browser in the console's config response --
+    so the names are checked directly. Without this, a pref rejected by
+    `browser_evaluator` could be set through this tool instead, and the finding
+    built on it would only die later at verification.
+
+    Args:
+        prefs: Caller-supplied prefs for the spawned browser.
+
+    Raises:
+        ValueError: One or more blocked pref names are present.
+    """
+    # Imported here for the same reason as the callers' imports: module scope
+    # would pull in grizzly.
+    from ..browser_evaluator import _load_pref_blocklist
+
+    matched = sorted(set(prefs or {}) & set(_load_pref_blocklist()))
+    if matched:
+        raise ValueError(f"Blocked prefs detected: {', '.join(matched)}")
 
 
 def _free_port(start: int = _FELT_UI_PORT_BASE) -> int:
@@ -305,6 +349,8 @@ async def felt_browser_evaluator(  # pragma: no cover
     firefox_root: Path,
     timeout: int = 120,
     email: str = "nobody@mozilla.org",
+    prefs: dict[str, str | int | bool] | None = None,
+    dlp_wasm: Path | None = None,
     enable_sandbox: bool = False,
 ) -> BrowserCrashInfo:
     """Run a testcase in the browser a real Felt sign-in spawns.
@@ -313,12 +359,13 @@ async def felt_browser_evaluator(  # pragma: no cover
     content in a web content process, and is opened with a null triggering
     principal rather than the system principal.
 
-    **How to prove your testcase ran.** `FuzzingFunctions` is not available
-    here: it is gated on `fuzzing.enabled`, and that pref currently cannot
-    reach the browser Felt spawns -- the console's `extra_prefs` is the only
-    delivery path and the fork hardcodes it. So page script cannot announce
-    itself the way it can under `browser_evaluator`. Use the request log
-    instead:
+    **How to prove your testcase ran.** Pass `prefs={"fuzzing.enabled": True}`
+    and `FuzzingFunctions` is available, exactly as under `browser_evaluator`.
+    Prefs reach the spawned browser through the console's `extra_prefs`, which
+    is the only path that works -- Felt chooses that browser's profile, so a
+    profile written here would be the wrong one.
+
+    The request log is the more robust proof, and needs no prefs at all:
 
     - `logs.stdout` contains `log_stdout_requests.txt`, one line per HTTP
       request the testcase made. Have the page fetch a uniquely named
@@ -345,6 +392,25 @@ async def felt_browser_evaluator(  # pragma: no cover
             whose mock console servers this starts.
         timeout: Seconds to let the testcase run once it is open.
         email: Address to sign in with; any address is accepted.
+        prefs: Preferences for the *spawned* browser, delivered through the
+            console's config response. Added to the entries the fork already
+            sends, never replacing them -- `marionette.port` is how this tool
+            attaches to the spawned browser at all. Checked against the
+            `FIREFOX_PREF_BLOCKLIST` file exactly as `browser_evaluator`
+            checks its prefs.js; a match raises ValueError before anything
+            launches, and the caller cannot disable the guard.
+        dlp_wasm: WebAssembly module to answer the DLP module fetch with.
+            Defaults to the fork's own test double under
+            `toolkit/components/contentanalysis/tests/`, which the stock mock
+            console does not serve at all -- it answers 404, leaving
+            `WasmModuleBackend` nothing to fetch and the whole DLP path
+            unreachable. **That double implements the real module's ABI but
+            does no matching**: it reads the verdict out of the submitted
+            content instead. So it supports findings about fetching,
+            compiling, instantiating and marshalling across the sandbox
+            boundary -- the fork's own code -- and supports nothing about
+            matching behaviour. Which module was served is recorded in
+            `log_stdout_session.txt`; say so in any finding that depends on it.
         enable_sandbox: Leave the sandbox enabled in the spawned browser. Same
             name, type and default as `browser_evaluator`'s, and the same
             seven `MOZ_DISABLE_*_SANDBOX` variables, so a testcase moves
@@ -364,6 +430,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     Raises:
         FileNotFoundError: The binary does not exist.
         RuntimeError: The session could not be established.
+        ValueError: `prefs` names a pref on the FIREFOX_PREF_BLOCKLIST file.
     """
     # Imported here to keep the module importable without grizzly installed.
     from ..browser_evaluator import (
@@ -375,6 +442,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
     _require_enterprise_build(firefox_binary)
+    _reject_blocked_prefs(prefs)
 
     felt_port = _free_port()
     work = Path(tempfile.mkdtemp(prefix="fxe-felt-eval-"))
@@ -404,7 +472,13 @@ async def felt_browser_evaluator(  # pragma: no cover
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst)
 
-    console = FeltConsole(firefox_root, log_path=log_dir / "log_console.txt")
+    wasm = dlp_wasm if dlp_wasm is not None else _default_dlp_wasm(firefox_root)
+    console = FeltConsole(
+        firefox_root,
+        log_path=log_dir / "log_console.txt",
+        extra_prefs=prefs or {},
+        dlp_wasm=wasm,
+    )
     server = _TestcaseServer(testcase_dir, log_dir / "log_stdout_requests.txt")
     proc: subprocess.Popen[bytes] | None = None
     remote_type: object = None
@@ -579,6 +653,8 @@ async def felt_browser_evaluator(  # pragma: no cover
         f"testcase_url: {server.url_for(entry_point)}\n"
         f"loaded_uri: {loaded_uri}\n"
         f"remote_type: {remote_type}\n"
+        f"extra_prefs: {sorted((prefs or {}).items())}\n"
+        f"dlp_wasm_served: {wasm}\n"
         f"enable_sandbox: {enable_sandbox}\n"
         "note: remote_type is the spawned browser's selectedBrowser.remoteType\n"
         "      just after the testcase was opened. A web content process reads\n"
