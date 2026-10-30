@@ -7,12 +7,15 @@ can be got wrong without one are here.
 
 import inspect
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 from ffpuppet.helpers import SANDBOX_ENV_VARS
 
 from fx_audit_mcp.browser_evaluator import browser_evaluator
 from fx_audit_mcp.felt.evaluator import (
+    FELT_UI_REMOTE_TYPE_JS,
+    OPEN_TESTCASE_IN_FELT_UI_JS,
     _managed_profile_port_file,
     apply_sandbox_env,
     felt_browser_evaluator,
@@ -117,3 +120,57 @@ class TestMarionettePortTimeout:
         (prof / "MarionetteActivePort").write_text("12345")
         got = _managed_profile_port_file(home, 1.0, log_dir=None)
         assert got.read_text() == "12345"
+
+
+class TestFeltUiAttackerPosition:
+    """Loading the testcase where the Felt actors actually are.
+
+    Felt actors register under `Services.felt?.isFeltUI()`, true only in the
+    Felt UI process. From the spawned browser `getActor("FeltProcess")` raises
+    NotFoundError, so a clean result there says nothing about the fork's actor
+    surface.
+    """
+
+    def test_default_is_the_spawned_browser(self) -> None:
+        """The new position is opt-in; most targets want ordinary browsing."""
+        param = inspect.signature(felt_browser_evaluator).parameters["attacker_process"]
+        assert param.default == "spawned"
+
+    def test_only_the_two_positions_are_accepted(self) -> None:
+        # get_type_hints, not the raw annotation: the module uses
+        # `from __future__ import annotations`, so annotations are strings.
+        hints = get_type_hints(felt_browser_evaluator)
+        assert get_args(hints["attacker_process"]) == ("spawned", "felt_ui")
+
+    def test_loads_the_portal_browser_not_the_signin_browser(self) -> None:
+        """`#browser` holds the console sign-in document; replacing it ends
+        the session this tool just established."""
+        assert 'getElementById("portal-browser")' in OPEN_TESTCASE_IN_FELT_UI_JS
+        assert 'getElementById("browser")' not in OPEN_TESTCASE_IN_FELT_UI_JS
+
+    def test_mirrors_the_production_captive_portal_load(self) -> None:
+        """This is CaptivePortal.showOverlay's load, not a harness invention.
+
+        It must use fixupAndLoadURIString with a null principal carrying the
+        private browsing id -- without the id the origin attributes do not
+        match the docshell and the document does not land in the process a
+        real portal page lands in.
+        """
+        assert "fixupAndLoadURIString" in OPEN_TESTCASE_IN_FELT_UI_JS
+        assert "createNullPrincipal" in OPEN_TESTCASE_IN_FELT_UI_JS
+        assert "privateBrowsingId" in OPEN_TESTCASE_IN_FELT_UI_JS
+
+    def test_reads_the_id_from_the_fork_rather_than_hardcoding_it(self) -> None:
+        """A hardcoded 1 would silently diverge if the fork changed it."""
+        assert "FeltCommon.PRIVATE_BROWSING_ID" in OPEN_TESTCASE_IN_FELT_UI_JS
+        assert "privateBrowsingId: 1" not in OPEN_TESTCASE_IN_FELT_UI_JS
+
+    def test_does_not_assume_gbrowser(self) -> None:
+        """felt.xhtml has no gBrowser -- that is why this is a separate script."""
+        assert "gBrowser" not in OPEN_TESTCASE_IN_FELT_UI_JS
+        assert "gBrowser" not in FELT_UI_REMOTE_TYPE_JS
+
+    def test_the_probe_reports_where_the_document_landed(self) -> None:
+        """remote_type is how a run proves it was web content, not an assumption."""
+        assert "remoteType" in FELT_UI_REMOTE_TYPE_JS
+        assert "portal-browser" in FELT_UI_REMOTE_TYPE_JS

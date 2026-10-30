@@ -43,6 +43,7 @@ from contextlib import suppress
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 
 from ffpuppet.helpers import SANDBOX_ENV_VARS
 
@@ -129,6 +130,51 @@ OPEN_TESTCASE_JS = """
 REMOTE_TYPE_JS = """
   const b = window.gBrowser && window.gBrowser.selectedBrowser;
   if (!b) return {ok: false, why: "no selectedBrowser"};
+  return {
+    ok: true,
+    remoteType: b.remoteType,
+    uri: b.currentURI && b.currentURI.spec,
+  };
+"""
+
+# The Felt UI's own window, for the `felt_ui` attacker position.
+#
+# Felt actors are registered under `MOZ_ENTERPRISE && Services.felt?.isFeltUI()`,
+# true only in this process. The browser Felt *spawns* has isFeltUI() false, so
+# a testcase there gets `NotFoundError: No such JSProcessActor 'FeltProcess'`
+# and the fork's whole actor surface is untestable from it.
+#
+# `felt.xhtml` has no gBrowser, so this is not OPEN_TESTCASE_JS against a
+# different target: it drives `#portal-browser` by id. That element is the
+# captive-portal slot, and loading it this way is not a harness invention --
+# it is what `CaptivePortal.showOverlay` does with a real portal URL, including
+# the private browsing id on the null principal, without which the origin
+# attributes do not match the docshell and the document does not land where a
+# portal page lands. The id is read from FeltCommon rather than hardcoded so a
+# change in the fork carries over.
+#
+# `#browser` is deliberately untouched: it holds the console sign-in document,
+# and replacing it ends the session this tool just established.
+OPEN_TESTCASE_IN_FELT_UI_JS = """
+  const browser = document.getElementById("portal-browser");
+  if (!browser) return {ok: false, why: "no #portal-browser in the Felt UI"};
+  const { FeltCommon } = ChromeUtils.importESModule(
+    "chrome://felt/content/FeltCommon.sys.mjs"
+  );
+  const pane = document.querySelector(".felt-login__portal");
+  if (pane) pane.classList.remove("is-hidden");
+  browser.fixupAndLoadURIString(arguments[0], {
+    triggeringPrincipal: Services.scriptSecurityManager.createNullPrincipal({
+      privateBrowsingId: FeltCommon.PRIVATE_BROWSING_ID,
+    }),
+  });
+  return {ok: true, privateBrowsingId: FeltCommon.PRIVATE_BROWSING_ID};
+"""
+
+# REMOTE_TYPE_JS's reading, against the portal browser.
+FELT_UI_REMOTE_TYPE_JS = """
+  const b = document.getElementById("portal-browser");
+  if (!b) return {ok: false, why: "no #portal-browser"};
   return {
     ok: true,
     remoteType: b.remoteType,
@@ -375,6 +421,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     policies: dict[str, object] | None = None,
     dlp_wasm: Path | None = None,
     enable_sandbox: bool = False,
+    attacker_process: Literal["spawned", "felt_ui"] = "spawned",
 ) -> BrowserCrashInfo:
     """Run a testcase in the browser a real Felt sign-in spawns.
 
@@ -446,6 +493,36 @@ async def felt_browser_evaluator(  # pragma: no cover
             boundary -- the fork's own code -- and supports nothing about
             matching behaviour. Which module was served is recorded in
             `log_stdout_session.txt`; say so in any finding that depends on it.
+        attacker_process: Which browser the testcase is loaded into, and so
+            which process your attacker occupies.
+
+            `spawned` (default) is the browser Felt launches after sign-in --
+            ordinary browsing, and the right position for anything a user
+            reaches by visiting a site.
+
+            `felt_ui` loads it into the Felt UI's own `#portal-browser`
+            instead. That matters because the Felt actors -- `FeltProcess`,
+            `FeltWindow`, `FeltErrorWindow`, `ContextMenu` -- are registered
+            under `Services.felt?.isFeltUI()`, true only in the Felt UI
+            process. From `spawned`, `getActor("FeltProcess")` raises
+            `NotFoundError` and the fork's actor surface cannot be tested at
+            all; a clean result from there says nothing about it.
+
+            This is a real position, not a harness contrivance. The same
+            `#portal-browser`, loaded the same way, is where
+            `CaptivePortal.showOverlay` puts a captive portal page -- content
+            the fork's own comment calls "untrusted third-party content". The
+            enterprise's SSO/IdP page and anything reachable from it also
+            render in that tree. So a finding here has a precondition worth
+            stating (the document shares a process tree with the console
+            session) but not an exotic one: a hotel network's portal page
+            qualifies.
+
+            `FeltProcess` is a JSProcessActor with no URL match, so it is
+            addressable from any content process in that tree.
+            `FeltWindowChild` additionally requires the SSO-callback URL
+            match -- note that pattern drops the port, so the console host at
+            any port satisfies it.
         enable_sandbox: Leave the sandbox enabled in the spawned browser. Same
             name, type and default as `browser_evaluator`'s, and the same
             seven `MOZ_DISABLE_*_SANDBOX` variables, so a testcase moves
@@ -625,6 +702,9 @@ async def felt_browser_evaluator(  # pragma: no cover
             # only starts the navigation that produces it.
             _submit_idp_form(felt_ui, timeout_s=60)
 
+            # The spawned browser is still waited for in both positions: it is
+            # the signal that the session completed, and under `felt_ui` the
+            # target may well be code that only the spawned browser runs.
             port_file = _managed_profile_port_file(
                 home_dir, timeout_s=180, log_dir=log_dir
             )
@@ -632,9 +712,17 @@ async def felt_browser_evaluator(  # pragma: no cover
             child.connect(attempts=60)
             child.new_session()
             child.set_context("chrome")
-            opened = child.execute_script(
-                OPEN_TESTCASE_JS, [server.url_for(entry_point)]
-            )
+
+            if attacker_process == "felt_ui":
+                driver, open_js, probe_js = (
+                    felt_ui,
+                    OPEN_TESTCASE_IN_FELT_UI_JS,
+                    FELT_UI_REMOTE_TYPE_JS,
+                )
+            else:
+                driver, open_js, probe_js = (child, OPEN_TESTCASE_JS, REMOTE_TYPE_JS)
+
+            opened = driver.execute_script(open_js, [server.url_for(entry_point)])
             opened_value = (
                 opened.get("value", opened) if isinstance(opened, dict) else opened
             )
@@ -646,7 +734,7 @@ async def felt_browser_evaluator(  # pragma: no cover
             # or navigating tab legitimately has nothing to report, and losing
             # the result would be worse than losing this detail.
             with suppress(Exception):
-                probed = child.execute_script(REMOTE_TYPE_JS, [])
+                probed = driver.execute_script(probe_js, [])
                 probed = (
                     probed.get("value", probed) if isinstance(probed, dict) else probed
                 )
@@ -695,6 +783,7 @@ async def felt_browser_evaluator(  # pragma: no cover
         f"extra_policies: {sorted(policies or {})}\n"
         f"dlp_wasm_served: {wasm}\n"
         f"enable_sandbox: {enable_sandbox}\n"
+        f"attacker_process: {attacker_process}\n"
         "note: remote_type is the spawned browser's selectedBrowser.remoteType\n"
         "      just after the testcase was opened. A web content process reads\n"
         "      as web or webIsolated=<site>; `file` would mean the testcase was\n"
