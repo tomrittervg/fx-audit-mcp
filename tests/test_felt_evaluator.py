@@ -17,6 +17,7 @@ from fx_audit_mcp.felt.evaluator import (
     FELT_UI_REMOTE_TYPE_JS,
     OPEN_TESTCASE_IN_FELT_UI_JS,
     _managed_profile_port_file,
+    _submit_idp_form,
     apply_sandbox_env,
     felt_browser_evaluator,
 )
@@ -174,3 +175,39 @@ class TestFeltUiAttackerPosition:
         """remote_type is how a run proves it was web content, not an assumption."""
         assert "remoteType" in FELT_UI_REMOTE_TYPE_JS
         assert "portal-browser" in FELT_UI_REMOTE_TYPE_JS
+
+
+class TestFeltUiWindowSurvival:
+    """The two bugs that made attacker_process="felt_ui" fail 258/258.
+
+    Both are about the Felt UI session still being usable after sign-in:
+    the window has to still exist, and Marionette has to still be pointed at
+    its chrome document.
+    """
+
+    def test_keep_window_pref_is_in_the_felt_ui_profile_writer(self) -> None:
+        """It must be in the UI's own user.js, not the `prefs` parameter.
+
+        `prefs` travels through the console's config response, which only the
+        *spawned* browser fetches -- several runs tried that and reported it
+        did not reach the Felt parent.
+        """
+        src = inspect.getsource(felt_browser_evaluator)
+        assert "enterprise.felt_tests.should_not_close_window" in src
+        marker = src.index("enterprise.felt_tests.should_not_close_window")
+        # It belongs to the user.js write, alongside the Felt UI's own port.
+        assert "marionette.port" in src[marker : marker + 400]
+
+    def test_idp_form_restores_chrome_context(self) -> None:
+        """_submit_idp_form switches to content and must switch back.
+
+        The portal load reads `#portal-browser` off the chrome document, so a
+        session left in content context finds nothing. Checked on both paths,
+        which is why the restore is in a `finally`.
+        """
+        src = inspect.getsource(_submit_idp_form)
+        assert 'set_context("content")' in src
+        assert 'set_context("chrome")' in src
+        assert "finally:" in src
+        # The restore must come after the content switch, not before it.
+        assert src.index('set_context("content")') < src.index("finally:")

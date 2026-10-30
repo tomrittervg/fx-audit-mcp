@@ -571,8 +571,24 @@ async def felt_browser_evaluator(  # pragma: no cover
     # marionette.port is a pref, not a command-line flag -- `--marionette` only
     # switches the server on. The spawned browser gets its own port from the
     # console's extra_prefs (marionette.port = 0), so the two cannot collide.
+    #
+    # `should_not_close_window` is what makes attacker_process="felt_ui"
+    # possible at all. On a successful sign-in the Felt parent sends
+    # `FeltParent:TransitionFeltToBackground`, and `Felt.sys.mjs` answers it
+    # with `enterLastWindowClosingSurvivalArea()` + `closeWindow()` -- the
+    # process survives but the window, and with it the chrome document holding
+    # `#portal-browser`, is destroyed. Every `felt_ui` call then died on
+    # "no such window: Browsing context has been discarded" (258 calls, 0
+    # successes, across one 183-target batch).
+    #
+    # `closeWindow()` checks this pref first and returns early -- the fork's
+    # own hook for "tests need to run code on FELT while Browser is running",
+    # which is exactly this. It must go in the Felt UI's *own* profile: the
+    # `prefs` parameter travels through the console's config response, which
+    # only the spawned browser fetches, so it cannot reach this process.
     (profile / "user.js").write_text(
         'user_pref("enterprise.log_level", "all");\n'
+        'user_pref("enterprise.felt_tests.should_not_close_window", true);\n'
         f'user_pref("marionette.port", {felt_port});\n',
         encoding="utf-8",
     )
@@ -816,20 +832,33 @@ def _submit_idp_form(felt_ui: Marionette, timeout_s: float) -> None:
     Raises:
         RuntimeError: The form never appeared.
     """
+    # Restored in `finally` on both paths. The form is in the Felt UI's content
+    # frame, so reaching it needs content context -- but the caller's session is
+    # the Felt UI's, and leaving it in content context breaks anything chrome
+    # that runs afterwards. That was latent until `attacker_process="felt_ui"`
+    # gave the caller a reason to use this session again: the portal load reads
+    # `document.getElementById("portal-browser")` off the *chrome* document, so
+    # in content context it finds nothing, and the sign-in content context it
+    # was left pointing at is discarded once Felt navigates on. Those are the
+    # "no #portal-browser in the Felt UI" and "no such window / Browsing
+    # context has been discarded" failures.
     felt_ui.set_context("content")
-    deadline = time.time() + timeout_s
-    last: object = None
-    while time.time() < deadline:
-        result = felt_ui.execute_script(SUBMIT_IDP_JS)
-        value = result.get("value", result) if isinstance(result, dict) else result
-        if isinstance(value, dict) and value.get("ok"):
-            return
-        last = value
-        time.sleep(1)
-    raise RuntimeError(
-        f"the identity-provider form never rendered: {last}."
-        " The Felt UI logs 'SSO login timed out' when this step is missed."
-    )
+    try:
+        deadline = time.time() + timeout_s
+        last: object = None
+        while time.time() < deadline:
+            result = felt_ui.execute_script(SUBMIT_IDP_JS)
+            value = result.get("value", result) if isinstance(result, dict) else result
+            if isinstance(value, dict) and value.get("ok"):
+                return
+            last = value
+            time.sleep(1)
+        raise RuntimeError(
+            f"the identity-provider form never rendered: {last}."
+            " The Felt UI logs 'SSO login timed out' when this step is missed."
+        )
+    finally:
+        felt_ui.set_context("chrome")
 
 
 def _child_responsive(child: Marionette) -> bool:
