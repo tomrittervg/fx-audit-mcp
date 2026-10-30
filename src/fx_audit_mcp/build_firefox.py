@@ -140,10 +140,19 @@ async def build_firefox(
 
     Returns:
         BuildResult with:
-        - success: Boolean indicating if the build completed successfully.
+        - success: Always True; a failed build raises instead.
         - exit_code: The build's exit status.
         - logs: Paths to the build's stdout/stderr log files.
-        - build_dir: The objdir on success.
+        - build_dir: The objdir.
+
+    Raises:
+        RuntimeError: The build failed. The message carries the exit code and
+            the stdout/stderr log paths, which are the only way to find out
+            why. A failed build is raised rather than returned so that it
+            registers as a tool error: a returned ``success: false`` is a
+            successful tool call as far as the MCP layer is concerned, and a
+            build that did not happen is not something a caller should be
+            able to read past.
     """
     if not firefox_dir.exists():
         raise FileNotFoundError(f"Firefox directory not found at {firefox_dir}")
@@ -230,10 +239,20 @@ async def build_firefox(
             logs=logs,
         )
 
-    return BuildResult(
-        success=False,
-        exit_code=process.returncode,
-        logs=logs,
+    # Raised, not returned. A BuildResult the MCP layer returns normally is a
+    # successful tool call carrying `success: false`, which the harness does
+    # not count as a tool error -- six builds failed that way across a
+    # 183-target batch and were invisible in every error metric. Raising makes
+    # a failed build an error the agent cannot read past.
+    #
+    # The log paths go in the message because they are the only way to find
+    # out *why* the build failed, and an exception discards the result object
+    # that would otherwise carry them. main() already catches RuntimeError,
+    # prints it and exits 1, so the CLI keeps its behaviour.
+    raise RuntimeError(
+        f"mach build failed with exit code {process.returncode}."
+        f" stdout: {', '.join(logs.stdout) or '(none)'};"
+        f" stderr: {', '.join(logs.stderr) or '(none)'}"
     )
 
 

@@ -308,7 +308,9 @@ def _free_port(start: int = _FELT_UI_PORT_BASE) -> int:
     raise RuntimeError(f"no free port in {start}..{start + 200}")
 
 
-def _managed_profile_port_file(home: Path, timeout_s: float) -> Path:
+def _managed_profile_port_file(
+    home: Path, timeout_s: float, log_dir: Path | None = None
+) -> Path:
     """Wait for the spawned browser to publish its Marionette port.
 
     Felt derives a managed profile per signed-in user under the enterprise
@@ -318,6 +320,10 @@ def _managed_profile_port_file(home: Path, timeout_s: float) -> Path:
     Args:
         home: The run's private HOME, under which Felt puts that profile.
         timeout_s: How long to wait for the file.
+        log_dir: Where this run's logs are being written. Named in the failure
+            so a caller has somewhere to look; without it the timeout says
+            only that nothing happened, which is the least useful thing a
+            harness can say.
 
     Raises:
         TimeoutError: The browser did not publish a port in time.
@@ -335,10 +341,26 @@ def _managed_profile_port_file(home: Path, timeout_s: float) -> Path:
             if found:
                 return found[-1]
         time.sleep(0.5)
+    # Name the logs that exist rather than describing them. This timeout fired
+    # on 21 of 183 runs in one batch, and because the message pointed at no
+    # file, 19 runs then guessed at paths under /tmp and got "No such file" --
+    # a diagnosable failure turned into two undiagnosable ones.
+    written = (
+        sorted(str(p) for p in log_dir.glob("*.txt") if p.stat().st_size)
+        if log_dir and log_dir.is_dir()
+        else []
+    )
+    searched = ", ".join(str(r) for r in roots)
     raise TimeoutError(
-        "the Felt UI did not spawn a browser that published a Marionette port."
+        "the Felt UI did not spawn a browser that published a Marionette port"
+        f" within {timeout_s:g}s. Looked for */MarionetteActivePort under:"
+        f" {searched}."
         " Check the Felt log for 'Not enough cookies!!' (the SSO server set no"
         " cookie) or for the sign-in never being driven."
+        f" Logs with content: {
+            ', '.join(written)
+            or '(none were written -- the UI itself probably never started)'
+        }"
     )
 
 
@@ -603,7 +625,9 @@ async def felt_browser_evaluator(  # pragma: no cover
             # only starts the navigation that produces it.
             _submit_idp_form(felt_ui, timeout_s=60)
 
-            port_file = _managed_profile_port_file(home_dir, timeout_s=180)
+            port_file = _managed_profile_port_file(
+                home_dir, timeout_s=180, log_dir=log_dir
+            )
             child = Marionette(int(port_file.read_text().strip()))
             child.connect(attempts=60)
             child.new_session()

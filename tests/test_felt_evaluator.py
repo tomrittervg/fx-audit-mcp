@@ -6,11 +6,17 @@ can be got wrong without one are here.
 """
 
 import inspect
+from pathlib import Path
 
+import pytest
 from ffpuppet.helpers import SANDBOX_ENV_VARS
 
 from fx_audit_mcp.browser_evaluator import browser_evaluator
-from fx_audit_mcp.felt.evaluator import apply_sandbox_env, felt_browser_evaluator
+from fx_audit_mcp.felt.evaluator import (
+    _managed_profile_port_file,
+    apply_sandbox_env,
+    felt_browser_evaluator,
+)
 
 
 class TestApplySandboxEnv:
@@ -63,3 +69,51 @@ def test_enable_sandbox_matches_browser_evaluator() -> None:
     stock = inspect.signature(browser_evaluator).parameters["enable_sandbox"]
     assert felt.default is stock.default is False
     assert felt.annotation == stock.annotation
+
+
+class TestMarionettePortTimeout:
+    """The timeout that fired on 21 of 183 runs in one batch.
+
+    It named no file, so 19 of those runs then guessed at log paths under
+    /tmp and got "No such file" -- one diagnosable failure became two
+    undiagnosable ones.
+    """
+
+    def test_names_the_logs_that_have_content(self, tmp_path: Path) -> None:
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "log_stderr.txt").write_text("Not enough cookies!!\n")
+        (logs / "log_console.txt").write_text("console output\n")
+        (logs / "log_empty.txt").write_text("")
+
+        with pytest.raises(TimeoutError) as exc_info:
+            _managed_profile_port_file(tmp_path / "home", 0.01, log_dir=logs)
+
+        message = str(exc_info.value)
+        assert str(logs / "log_stderr.txt") in message
+        assert str(logs / "log_console.txt") in message
+        # An empty file is a dead end, not a lead.
+        assert "log_empty.txt" not in message
+
+    def test_says_so_when_nothing_was_written(self, tmp_path: Path) -> None:
+        """No logs at all means the UI never started -- a different diagnosis."""
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        with pytest.raises(TimeoutError) as exc_info:
+            _managed_profile_port_file(tmp_path / "home", 0.01, log_dir=logs)
+        assert "none were written" in str(exc_info.value)
+
+    def test_names_the_paths_it_searched(self, tmp_path: Path) -> None:
+        with pytest.raises(TimeoutError) as exc_info:
+            _managed_profile_port_file(tmp_path / "home", 0.01)
+        message = str(exc_info.value)
+        assert "firefoxenterprise" in message
+        assert "MarionetteActivePort" in message
+
+    def test_returns_the_port_file_when_it_appears(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        prof = home / ".mozilla" / "firefoxenterprise" / "enterprise-profile-x"
+        prof.mkdir(parents=True)
+        (prof / "MarionetteActivePort").write_text("12345")
+        got = _managed_profile_port_file(home, 1.0, log_dir=None)
+        assert got.read_text() == "12345"

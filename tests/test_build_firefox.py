@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -115,8 +116,13 @@ async def test_successful_build(mocker: MockerFixture, tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_failed_build(mocker: MockerFixture, tmp_path: Path) -> None:
-    """A failed build returns success=False with stdout/stderr."""
+async def test_failed_build_raises(mocker: MockerFixture, tmp_path: Path) -> None:
+    """A failed build raises, so the MCP layer records a tool error.
+
+    Returning ``success: false`` is a *successful* tool call as far as MCP is
+    concerned; six builds failed that way across a 183-target batch and showed
+    up in no error metric.
+    """
     firefox_dir = tmp_path / "firefox"
     mozconfig = tmp_path / "mozconfig"
 
@@ -127,12 +133,21 @@ async def test_failed_build(mocker: MockerFixture, tmp_path: Path) -> None:
     mock_process.stderr = _FakeStream([b"Error: build failed\n"])
     mocker.patch("asyncio.create_subprocess_exec", return_value=mock_process)
 
-    result = await build_firefox(firefox_dir, mozconfig)
+    with pytest.raises(RuntimeError) as exc_info:
+        await build_firefox(firefox_dir, mozconfig)
 
-    assert result.success is False
-    assert result.exit_code == 1
-    assert Path(result.logs.stdout[0]).read_bytes() == b"Build output\n"
-    assert Path(result.logs.stderr[0]).read_bytes() == b"Error: build failed\n"
+    message = str(exc_info.value)
+    assert "exit code 1" in message
+    # The logs are the only route to *why* it failed, and raising discards the
+    # result object that would have carried them -- so they must be in here.
+    logged = [
+        Path(token)
+        for token in re.split(r"[\s,;]+", message)
+        if token.endswith(".txt") and Path(token).is_file()
+    ]
+    assert logged, f"no readable log path in {message!r}"
+    assert b"Build output\n" in b"".join(p.read_bytes() for p in logged)
+    assert b"Error: build failed\n" in b"".join(p.read_bytes() for p in logged)
 
 
 @pytest.mark.anyio
