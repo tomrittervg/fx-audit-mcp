@@ -381,10 +381,11 @@ def _build_testcase(file_paths: dict[str, Path], entry_point: str) -> TestCase:
 
 
 def _categorize_logs(log_dir: Path) -> CrashLogPaths:
-    """Categorize the log_*.txt files in *log_dir* into stderr/stdout/crashdata.
+    """Categorize the log_* files in *log_dir* into stderr/stdout/crashdata.
 
     Args:
-        log_dir: Directory containing log_*.txt files emitted by grizzly.
+        log_dir: Directory containing the log_* files emitted by grizzly or,
+            for the Felt evaluator, written directly.
 
     Returns:
         CrashLogPaths holding the absolute path of every matched file, sorted
@@ -392,7 +393,19 @@ def _categorize_logs(log_dir: Path) -> CrashLogPaths:
     """
     paths: dict[str, list[str]] = {"stderr": [], "stdout": [], "crashdata": []}
 
-    for path in sorted(log_dir.glob("log_*.txt")):
+    # `log_*`, not `log_*.txt`. ASAN appends `.<pid>` to its `log_path`, so the
+    # Felt evaluator's reports land as `log_ffp_asan.15924` and a `.txt` glob
+    # never saw them: `crashdata` came back empty, `_extract_crash_pids` found
+    # no pids, and `crashed=bool(crash_pids)` was therefore False for every
+    # run ever made. Across a 183-target batch `"crashed":true` appeared zero
+    # times while `MOZ_DIAGNOSTIC_ASSERT` appeared 95 times and ASAN reports
+    # were written in 13 runs -- agents found those reports by hand, in the
+    # directory this function had just declared empty. `_wait_for_crash` in
+    # the Felt evaluator globs `log_ffp_asan*` and so always saw them, which
+    # is why the hang detection worked while the crash reporting did not.
+    for path in sorted(log_dir.glob("log_*")):
+        if not path.is_file():
+            continue
         log_name = path.name.lower()
         if "stderr" in log_name:
             paths["stderr"].append(str(path))

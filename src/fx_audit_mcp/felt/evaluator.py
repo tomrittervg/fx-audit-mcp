@@ -31,6 +31,7 @@ parsers then turn the logs into the same result model.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -586,10 +587,28 @@ async def felt_browser_evaluator(  # pragma: no cover
     # which is exactly this. It must go in the Felt UI's *own* profile: the
     # `prefs` parameter travels through the console's config response, which
     # only the spawned browser fetches, so it cannot reach this process.
+    #
+    # Under attacker_process="felt_ui" the caller's prefs have to be written
+    # here as well. They otherwise travel only in the console's config
+    # response, which the *spawned* browser fetches and this process does
+    # not -- so `fuzzing.enabled` never took effect in the Felt UI and
+    # `FuzzingFunctions` was undefined in exactly the document this mode
+    # exists to create. The evaluator still returned crashed:false,
+    # timed_out:false, so a probe that never ran looked like a clean
+    # negative; 23 of 46 runs in one batch slice lost a cycle to it.
+    #
+    # Written for both positions rather than only felt_ui: a pref the caller
+    # asked for should hold wherever its testcase lands, and the spawned
+    # browser gets the same values through the console regardless. They are
+    # already blocklist-checked by `_reject_blocked_prefs` above.
+    extra_user_prefs = "".join(
+        f"user_pref({json.dumps(name)}, {json.dumps(value)});\n"
+        for name, value in (prefs or {}).items()
+    )
     (profile / "user.js").write_text(
         'user_pref("enterprise.log_level", "all");\n'
         'user_pref("enterprise.felt_tests.should_not_close_window", true);\n'
-        f'user_pref("marionette.port", {felt_port});\n',
+        f'user_pref("marionette.port", {felt_port});\n' + extra_user_prefs,
         encoding="utf-8",
     )
 

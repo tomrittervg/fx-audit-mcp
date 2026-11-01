@@ -12,7 +12,11 @@ from typing import get_args, get_type_hints
 import pytest
 from ffpuppet.helpers import SANDBOX_ENV_VARS
 
-from fx_audit_mcp.browser_evaluator import browser_evaluator
+from fx_audit_mcp.browser_evaluator import (
+    _categorize_logs,
+    _extract_crash_pids,
+    browser_evaluator,
+)
 from fx_audit_mcp.felt.evaluator import (
     FELT_UI_REMOTE_TYPE_JS,
     OPEN_TESTCASE_IN_FELT_UI_JS,
@@ -211,3 +215,68 @@ class TestFeltUiWindowSurvival:
         assert "finally:" in src
         # The restore must come after the content switch, not before it.
         assert src.index('set_context("content")') < src.index("finally:")
+
+
+class TestCrashDetection:
+    """ASAN reports were invisible to the result, so no run ever reported one.
+
+    `"crashed":true` appeared zero times across a 183-target batch while
+    `MOZ_DIAGNOSTIC_ASSERT` appeared 95 times and ASAN reports were written
+    in 13 runs. Agents found those reports by hand in the directory the
+    evaluator had just declared empty.
+    """
+
+    def test_asan_report_without_txt_suffix_is_crashdata(self, tmp_path: Path) -> None:
+        """ASAN appends `.<pid>` to log_path, so the file is not a .txt."""
+        (tmp_path / "log_stderr.txt").write_text("x")
+        (tmp_path / "log_ffp_asan.15924").write_text(
+            "==15924==ERROR: AddressSanitizer: heap-use-after-free\n"
+        )
+        logs = _categorize_logs(tmp_path)
+        assert [Path(p).name for p in logs.crashdata] == ["log_ffp_asan.15924"]
+        assert _extract_crash_pids(logs.crashdata) == [15924]
+
+    def test_the_named_buckets_still_win(self, tmp_path: Path) -> None:
+        """Widening the glob must not pull stderr/stdout into crashdata."""
+        for n in ("log_stderr.txt", "log_stdout.txt", "log_stdout_requests.txt"):
+            (tmp_path / n).write_text("x")
+        logs = _categorize_logs(tmp_path)
+        assert not logs.crashdata
+        assert len(logs.stderr) == 1 and len(logs.stdout) == 2
+
+    def test_directories_are_skipped(self, tmp_path: Path) -> None:
+        """The glob is no longer extension-anchored, so it can match a dir."""
+        (tmp_path / "log_profile").mkdir()
+        logs = _categorize_logs(tmp_path)
+        assert not (logs.crashdata or logs.stderr or logs.stdout)
+
+
+class TestFeltUiPrefs:
+    """Caller prefs reached only the spawned browser, never the Felt UI.
+
+    They travel in the console's config response, which this process does not
+    fetch -- so `fuzzing.enabled` was silently inert under
+    attacker_process="felt_ui" and `FuzzingFunctions` was undefined in the
+    document that mode exists to create, while the result still read
+    crashed:false / timed_out:false.
+    """
+
+    def test_caller_prefs_are_written_to_the_felt_ui_profile(self) -> None:
+        src = inspect.getsource(felt_browser_evaluator)
+        assert "extra_user_prefs" in src
+        # Must be JSON-encoded: `True` is not a valid pref literal, `true` is.
+        assert "json.dumps(value)" in src
+        marker = src.index("extra_user_prefs")
+        assert "user.js" in src[marker : marker + 900]
+
+    def test_pref_values_render_as_js_literals(self) -> None:
+        import json as _json
+
+        rendered = "".join(
+            f"user_pref({_json.dumps(k)}, {_json.dumps(v)});\n"
+            for k, v in {"fuzzing.enabled": True, "a.b": "s", "n": 3}.items()
+        )
+        assert 'user_pref("fuzzing.enabled", true);' in rendered
+        assert 'user_pref("a.b", "s");' in rendered
+        assert 'user_pref("n", 3);' in rendered
+        assert "True" not in rendered
