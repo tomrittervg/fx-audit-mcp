@@ -22,6 +22,7 @@ from fx_audit_mcp.felt.evaluator import (
     OPEN_TESTCASE_IN_FELT_UI_JS,
     _managed_profile_port_file,
     _submit_idp_form,
+    _testcase_was_fetched,
     apply_sandbox_env,
     felt_browser_evaluator,
 )
@@ -280,3 +281,98 @@ class TestFeltUiPrefs:
         assert 'user_pref("a.b", "s");' in rendered
         assert 'user_pref("n", 3);' in rendered
         assert "True" not in rendered
+
+
+class TestTestcaseWasFetched:
+    """The replacement for `loaded_uri`, which had a zero true-negative rate.
+
+    `loaded_uri` sampled `selectedBrowser.currentURI` just after the load was
+    started, so it raced navigation and read `about:blank` in 110 of 111
+    Felt-UI sessions whose entry point the server had served with a 200. Two
+    agents were misled into believing their testcase had not run. The request
+    log it is replaced by was correct in all 341 sessions.
+    """
+
+    _LOG = (
+        '15:18:04 127.0.0.1 "GET /testcase.html HTTP/1.1" 200 -\n'
+        '15:18:05 127.0.0.1 "GET /favicon.ico HTTP/1.1" 404 -\n'
+    )
+
+    def test_entry_point_served(self, tmp_path: Path) -> None:
+        log = tmp_path / "requests.txt"
+        log.write_text(self._LOG)
+        assert _testcase_was_fetched(log, "testcase.html") is True
+
+    def test_leading_slash_tolerated(self, tmp_path: Path) -> None:
+        log = tmp_path / "requests.txt"
+        log.write_text(self._LOG)
+        assert _testcase_was_fetched(log, "/testcase.html") is True
+
+    def test_not_served_is_false(self, tmp_path: Path) -> None:
+        log = tmp_path / "requests.txt"
+        log.write_text(self._LOG)
+        assert _testcase_was_fetched(log, "other.html") is False
+
+    def test_non_200_is_false(self, tmp_path: Path) -> None:
+        """A 404 for the entry point is not a load."""
+        log = tmp_path / "requests.txt"
+        log.write_text('15:18:05 127.0.0.1 "GET /gone.html HTTP/1.1" 404 -\n')
+        assert _testcase_was_fetched(log, "gone.html") is False
+
+    def test_missing_log_is_false_not_an_error(self, tmp_path: Path) -> None:
+        """A crashed run can leave no log; that must not lose the result."""
+        assert _testcase_was_fetched(tmp_path / "absent.txt", "testcase.html") is False
+
+    def test_subdirectory_entry_point(self, tmp_path: Path) -> None:
+        log = tmp_path / "requests.txt"
+        log.write_text('15:18:04 127.0.0.1 "GET /sub/frame.html HTTP/1.1" 200 -\n')
+        assert _testcase_was_fetched(log, "sub/frame.html") is True
+
+
+class TestTestcaseFetchedIsPerLine:
+    """Regressions the first version of these tests could not see.
+
+    Proved vacuous by mutation: replacing the per-line scan with a whole-text
+    one, and dropping ` HTTP` from the match, both left the suite green.
+    """
+
+    _LOG = (
+        '15:18:04 127.0.0.1 "GET /testcase.html HTTP/1.1" 200 -\n'
+        '15:18:05 127.0.0.1 "GET /favicon.ico HTTP/1.1" 404 -\n'
+    )
+
+    def test_404_path_in_a_log_that_also_has_a_200(self, tmp_path: Path) -> None:
+        """The status must be the one on the entry point's own line."""
+        log = tmp_path / "r.txt"
+        log.write_text(self._LOG)
+        assert _testcase_was_fetched(log, "favicon.ico") is False
+
+    def test_entry_point_is_not_a_prefix_match(self, tmp_path: Path) -> None:
+        log = tmp_path / "r.txt"
+        log.write_text('15:18:04 127.0.0.1 "GET /testcase.html.bak HTTP/1.1" 200 -\n')
+        assert _testcase_was_fetched(log, "testcase.html") is False
+
+    def test_percent_encoded_name_still_matches(self, tmp_path: Path) -> None:
+        """A name the browser had to encode is still the name we asked for.
+
+        Plain substring matching reported these as unserved -- reintroducing
+        the false negative this whole field exists to remove.
+        """
+        log = tmp_path / "r.txt"
+        log.write_text('15:18:04 127.0.0.1 "GET /my%20test.html HTTP/1.1" 200 -\n')
+        assert _testcase_was_fetched(log, "my test.html") is True
+
+    def test_200_inside_the_path_is_not_a_status(self, tmp_path: Path) -> None:
+        log = tmp_path / "r.txt"
+        log.write_text('15:18:04 127.0.0.1 "GET /t.html?x= 200 y HTTP/1.1" 404 -\n')
+        assert _testcase_was_fetched(log, "t.html") is False
+
+    def test_query_string_ignored(self, tmp_path: Path) -> None:
+        log = tmp_path / "r.txt"
+        log.write_text('15:18:04 127.0.0.1 "GET /t.html?a=1 HTTP/1.1" 200 -\n')
+        assert _testcase_was_fetched(log, "t.html") is True
+
+    def test_head_is_not_a_fetch(self, tmp_path: Path) -> None:
+        log = tmp_path / "r.txt"
+        log.write_text('15:18:04 127.0.0.1 "HEAD /t.html HTTP/1.1" 200 -\n')
+        assert _testcase_was_fetched(log, "t.html") is False

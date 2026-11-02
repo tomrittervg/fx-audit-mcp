@@ -45,6 +45,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
+from urllib.parse import unquote
 
 from ffpuppet.helpers import SANDBOX_ENV_VARS
 
@@ -645,10 +646,10 @@ async def felt_browser_evaluator(  # pragma: no cover
         dlp_wasm=wasm,
         account=account or {},
     )
-    server = _TestcaseServer(testcase_dir, log_dir / "log_stdout_requests.txt")
+    requests_log = log_dir / "log_stdout_requests.txt"
+    server = _TestcaseServer(testcase_dir, requests_log)
     proc: subprocess.Popen[bytes] | None = None
     remote_type: object = None
-    loaded_uri: object = None
     try:
         endpoints = console.start()
         env = {
@@ -793,7 +794,6 @@ async def felt_browser_evaluator(  # pragma: no cover
                 )
                 if isinstance(probed, dict) and probed.get("ok"):
                     remote_type = probed.get("remoteType")
-                    loaded_uri = probed.get("uri")
 
             window_expired = _wait_for_crash(log_dir, proc, timeout)
             # `timed_out` means a hang in browser_evaluator's vocabulary, and a
@@ -830,7 +830,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     # log rather than added to BrowserCrashInfo, which browser_evaluator shares.
     (log_dir / "log_stdout_session.txt").write_text(
         f"testcase_url: {server.url_for(entry_point)}\n"
-        f"loaded_uri: {loaded_uri}\n"
+        f"testcase_fetched: {_testcase_was_fetched(requests_log, entry_point)}\n"
         f"remote_type: {remote_type}\n"
         f"extra_prefs: {sorted((prefs or {}).items())}\n"
         f"extra_policies: {sorted(policies or {})}\n"
@@ -838,10 +838,16 @@ async def felt_browser_evaluator(  # pragma: no cover
         f"account_overrides: {sorted((account or {}).items())}\n"
         f"enable_sandbox: {enable_sandbox}\n"
         f"attacker_process: {attacker_process}\n"
-        "note: remote_type is the spawned browser's selectedBrowser.remoteType\n"
-        "      just after the testcase was opened. A web content process reads\n"
-        "      as web or webIsolated=<site>; `file` would mean the testcase was\n"
-        "      not served over HTTP and the security context is wrong.\n",
+        "note: remote_type is the remoteType of the browser the testcase was\n"
+        "      opened in -- the spawned browser's selectedBrowser, or the\n"
+        "      Felt UI's #portal-browser under attacker_process=felt_ui\n"
+        "      (felt.xhtml has no gBrowser, so there is no selectedBrowser\n"
+        "      in that position). A web content\n"
+        "      process reads as web or webIsolated=<site>; `file` would mean\n"
+        "      the testcase was not served over HTTP and the security context\n"
+        "      is wrong. testcase_fetched comes from the server's own request\n"
+        "      log, so it says whether the document was served, not whether\n"
+        "      script in it ran.\n",
         encoding="utf-8",
     )
 
@@ -920,6 +926,49 @@ def _child_responsive(child: Marionette) -> bool:
         return False
     value = answer.get("value", answer) if isinstance(answer, dict) else answer
     return value == 2
+
+
+# One access-log line: `15:18:04 127.0.0.1 "GET /x.html HTTP/1.1" 200 -`.
+# Parsed rather than substring-matched: a literal `" 200 "` test reads a 200
+# inside a path or a timestamp as a status, and a plain-text compare misses a
+# name the browser had to percent-encode -- which would silently report the
+# document as unserved, the exact failure this field replaced.
+_REQUEST_LINE_RE = re.compile(
+    r'"(?P<method>[A-Z]+) (?P<path>\S+) HTTP/[\d.]+" (?P<code>\d{3})'
+)
+
+
+def _testcase_was_fetched(requests_log: Path, entry_point: str) -> bool:
+    """Whether the testcase's entry point was actually served.
+
+    Replaces the `loaded_uri` field, which was sampled from
+    `selectedBrowser.currentURI` immediately after the load was *started* and
+    so raced navigation: it read `about:blank` in 110 of 111 Felt-UI sessions
+    whose entry point the server had in fact served with a 200. Its
+    true-negative rate was zero -- it never once correctly reported a load
+    that did not happen -- while this log was correct in all 341.
+
+    Args:
+        requests_log: The testcase server's request log.
+        entry_point: The testcase-relative name the browser loads first.
+
+    Returns:
+        True when the log records a 200 for the entry point.
+    """
+    try:
+        text = requests_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    want = unquote(entry_point.lstrip("/")).split("?", 1)[0]
+    for line in text.splitlines():
+        match = _REQUEST_LINE_RE.search(line)
+        if not match:
+            continue
+        if match["code"] != "200" or match["method"] != "GET":
+            continue
+        if unquote(match["path"].lstrip("/")).split("?", 1)[0] == want:
+            return True
+    return False
 
 
 def _wait_for_crash(log_dir: Path, proc: subprocess.Popen[bytes], timeout: int) -> bool:
