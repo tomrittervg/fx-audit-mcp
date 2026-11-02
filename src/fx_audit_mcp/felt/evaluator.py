@@ -847,10 +847,11 @@ async def felt_browser_evaluator(  # pragma: no cover
 
     logs = _categorize_logs(log_dir)
     crash_pids = _extract_crash_pids(logs.crashdata)
-    # parent_pid is None: the Felt UI's pid is not the spawned browser's
-    # parent, so attribution rests on the ChildProcessLifecycle records in
-    # stderr alone. An unresolved pid leaves the child flags None rather
-    # than False, which is the conservative direction.
+    # parent_pid is None because the Felt UI's pid is not the spawned
+    # browser's parent -- Felt launches that itself. Attribution does not
+    # depend on it: _crashed_process_fields recovers every parent from the
+    # MOZ_LOG prefix on the ChildProcessLifecycle records, which covers the
+    # Felt UI and the browser under test alike.
     fields = _crashed_process_fields(logs, parent_pid=None)
     return BrowserCrashInfo(
         crashed=bool(crash_pids),

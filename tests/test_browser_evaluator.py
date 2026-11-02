@@ -37,7 +37,7 @@ be_module = sys.modules["fx_audit_mcp.browser_evaluator"]
 
 
 def _write_grizzly_logs(
-    log_dir: Path, stderr: str = "", crashdata: str = ""
+    log_dir: Path, stderr: str = "", crashdata: str = "", stdout: str = ""
 ) -> CrashLogPaths:
     """Lay out log text as grizzly log files and return their categorized paths.
 
@@ -47,6 +47,8 @@ def _write_grizzly_logs(
     """
     if stderr:
         (log_dir / "log_stderr.txt").write_text(stderr)
+    if stdout:
+        (log_dir / "log_stdout.txt").write_text(stdout)
     if crashdata:
         (log_dir / "log_ffp_asan_0.txt").write_text(crashdata)
     return _categorize_logs(log_dir)
@@ -856,12 +858,27 @@ class TestCrashedProcessFields:
                 _PARENT_PID,
                 {"crashed_parent": None, "crashed_gpu": None},
             ),
-            # Parent PID unknown, e.g. a crash during launch.
+            # Parent PID not supplied by the caller. It is still resolved,
+            # from the MOZ_LOG prefix on the launch record, so the parent can
+            # be positively ruled out rather than reported unknown. This case
+            # expected None while attribution depended on the caller knowing
+            # the pid; the Felt evaluator never does.
             (
                 _GPU_LAUNCH_LOG,
                 _GPU_CRASH_LOG,
                 None,
-                {"crashed_parent": None, "crashed_gpu": True},
+                {"crashed_parent": False, "crashed_gpu": True},
+            ),
+            # A lifecycle record with no parent prefix is not trusted, so
+            # nothing is resolved from it. The prefix is required because
+            # MOZ_LOG carries page-controlled text in the same stream; every
+            # one of the 7472 real records in the reference corpus has it.
+            (
+                "I/ChildProcessLifecycle ++PROCESS [pid = 4243]"
+                " [childID = 2] [type = gpu]\n",
+                _GPU_CRASH_LOG,
+                None,
+                {"crashed_parent": None, "crashed_gpu": None},
             ),
         ],
     )
@@ -904,3 +921,200 @@ class TestIgnoredSignatures:
         monkeypatch.setattr(be_module, "IGNORED_SIGNATURES_DIR", sig_dir)
         sigs = _load_ignored_signatures()
         assert len(sigs) == 1
+
+
+class TestLifecycleRecordsOnStdout:
+    """Attribution must read the stream Gecko actually writes these to.
+
+    ChildProcessLifecycle goes through MOZ_LOG, which lands on stdout. The
+    attribution read only stderr, which is empty in every Felt session, so
+    `crashed_parent` was null in all 1,601 evaluator results of one
+    183-target batch: the crash was detected and the process never named.
+    """
+
+    # The real shape, prefix included: the prefix is what identifies the
+    # parent that spawned the child.
+    _STDOUT = (
+        "[Parent 8001: IPC I/O Parent]: I/ChildProcessLifecycle "
+        "++PROCESS [pid = 8107] [childID = 2] [type = tab]\n"
+    )
+    _PARENT_CRASH = "==8001==ERROR: AddressSanitizer: heap-use-after-free\n"
+    _CHILD_CRASH = "==8107==ERROR: AddressSanitizer: heap-use-after-free\n"
+
+    def test_child_type_resolved_from_stdout(self, tmp_path: Path) -> None:
+        logs = _write_grizzly_logs(
+            tmp_path, stdout=self._STDOUT, crashdata=self._CHILD_CRASH
+        )
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_content"] is True
+        assert fields["crashed_parent"] is False
+
+    def test_parent_recovered_without_a_known_pid(self, tmp_path: Path) -> None:
+        """The Felt evaluator cannot supply parent_pid, and does not need to.
+
+        It launches the sign-in UI; the browser under test is spawned by that,
+        so the pid Popen returned is not the crashing process's parent. The
+        MOZ_LOG prefix names the real parent.
+        """
+        logs = _write_grizzly_logs(
+            tmp_path, stdout=self._STDOUT, crashdata=self._PARENT_CRASH
+        )
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_parent"] is True
+        assert fields["crashed_content"] is False
+
+    def test_stderr_still_works(self, tmp_path: Path) -> None:
+        """Non-Felt runs that do log to stderr must be unaffected."""
+        logs = _write_grizzly_logs(
+            tmp_path, stderr=self._STDOUT, crashdata=self._CHILD_CRASH
+        )
+        assert _crashed_process_fields(logs, parent_pid=None)["crashed_content"] is True
+
+    def test_no_records_leaves_parent_unresolved(self, tmp_path: Path) -> None:
+        """With nothing to go on, say so rather than claiming not-the-parent."""
+        logs = _write_grizzly_logs(tmp_path, crashdata=self._CHILD_CRASH)
+        assert _crashed_process_fields(logs, parent_pid=None)["crashed_parent"] is None
+
+
+class TestLifecycleRecordsAreNotForgeable:
+    """A testcase must not be able to choose its own crash attribution.
+
+    MOZ_LOG's PageMessages module writes page-controlled strings into the
+    same stream as the lifecycle records. Matching a `[Parent N:` prefix
+    anywhere on a line that also contained `++PROCESS` let a testcase forge
+    one: `crashed_parent` is the highest-severity field this tool emits, and
+    the document under test could set it.
+    """
+
+    _REAL = (
+        "[Parent 8001: IPC I/O Parent]: I/ChildProcessLifecycle "
+        "++PROCESS [pid = 8107] [childID = 2] [type = tab]\n"
+    )
+    _FORGED = (
+        "[Child 8107: Main Thread]: E/PageMessages [JavaScript Error: "
+        '"[Parent 8107: IPC I/O Parent]: I/ChildProcessLifecycle '
+        '++PROCESS [pid = 31337] [childID = 9] [type = tab]"]\n'
+    )
+
+    def test_page_cannot_promote_its_own_crash_to_the_parent(
+        self, tmp_path: Path
+    ) -> None:
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL + self._FORGED,
+            crashdata="==8107==ERROR: AddressSanitizer: heap-use-after-free\n",
+        )
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_parent"] is False
+        assert fields["crashed_content"] is True
+
+    def test_forged_record_does_not_invent_a_process(self, tmp_path: Path) -> None:
+        """The forged pid must not become an attributable child either."""
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL + self._FORGED,
+            crashdata="==31337==ERROR: AddressSanitizer: heap-use-after-free\n",
+        )
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_content"] is None
+        assert fields["crashed_parent"] is None
+
+    def test_unattributable_pid_leaves_an_inferred_parent_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """A browser that dies in startup emits no record of its own parent.
+
+        Saying `crashed_parent: False` there is a confident negative about
+        the one pid the function just failed to place.
+        """
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL,
+            crashdata="==9000==ERROR: AddressSanitizer: SEGV on unknown address\n",
+        )
+        assert _crashed_process_fields(logs, parent_pid=None)["crashed_parent"] is None
+
+    def test_supplied_parent_pid_still_rules_the_parent_out(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller-supplied pid is authoritative, so the negative stands."""
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL,
+            crashdata="==9000==ERROR: AddressSanitizer: SEGV on unknown address\n",
+        )
+        assert _crashed_process_fields(logs, parent_pid=8001)["crashed_parent"] is False
+
+
+class TestForgeryViaNewlineInjection:
+    """MOZ_LOG does not escape console messages, so a page can start a line.
+
+    Anchoring the record to column 0 is therefore not sufficient on its own:
+    a newline inside page-authored text puts the remainder at column 0. Real
+    examples are in the reference corpus, where each stack frame of a
+    JavaScript warning begins a line. These tests pin the two corroborations
+    that close the reachable attacks.
+    """
+
+    _REAL = (
+        "[Parent 10001: IPC I/O Parent]: I/ChildProcessLifecycle "
+        "++PROCESS [pid = 10214] [childID = 5] [type = tab]\n"
+    )
+    # The page's own content process announces itself before it can inject.
+    _CHILD = '[Child 10214: Main Thread]: W/PageMessages [JavaScript Warning: "x\n'
+    _FORGE = (
+        "[Parent 10214: IPC I/O Parent]: I/ChildProcessLifecycle "
+        "++PROCESS [pid = 31337] [childID = 9] [type = tab]\n"
+    )
+    _CRASH = "==10214==ERROR: AddressSanitizer: heap-use-after-free\n"
+
+    @pytest.mark.parametrize(
+        "wrapper",
+        ["", 'console.error: FeltBrowser: "[10001]: ', "[pid=10001] "],
+        ids=["bare", "felt-wrapped", "pid-wrapped"],
+    )
+    def test_page_cannot_promote_itself_to_parent(
+        self, wrapper: str, tmp_path: Path
+    ) -> None:
+        """Every permitted wrapper is reachable by page text, so none is trusted."""
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL + self._CHILD + wrapper + self._FORGE,
+            crashdata=self._CRASH,
+        )
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_parent"] is False
+        assert fields["crashed_content"] is True
+
+    def test_page_cannot_retype_itself_to_hide_a_crash(self, tmp_path: Path) -> None:
+        """Last-wins let an appended record erase a real content crash."""
+        retype = (
+            "[Parent 10001: x]: I/ChildProcessLifecycle "
+            "++PROCESS [pid = 10214] [childID = 5] [type = vr]\n"
+        )
+        logs = _write_grizzly_logs(
+            tmp_path,
+            stdout=self._REAL + self._CHILD + retype,
+            crashdata=self._CRASH,
+        )
+        assert _crashed_process_fields(logs, parent_pid=None)["crashed_content"] is True
+
+    def test_genuine_pid_reuse_still_retypes(self, tmp_path: Path) -> None:
+        """An exit record makes the next launch legitimate; it must still win."""
+        stdout = (
+            self._REAL + "[Parent 10001: x]: I/ChildProcessLifecycle "
+            "--PROCESS [pid = 10214] [childID = 5] [type = tab]\n"
+            + "[Parent 10001: x]: I/ChildProcessLifecycle "
+            "++PROCESS [pid = 10214] [childID = 6] [type = gpu]\n"
+        )
+        logs = _write_grizzly_logs(tmp_path, stdout=stdout, crashdata=self._CRASH)
+        fields = _crashed_process_fields(logs, parent_pid=None)
+        assert fields["crashed_gpu"] is True
+        assert fields["crashed_content"] is False
+
+    def test_request_log_is_not_scanned(self, tmp_path: Path) -> None:
+        """The request log is attacker-chosen text; keep it out of attribution."""
+        (tmp_path / "log_stdout_requests.txt").write_text(self._FORGE)
+        (tmp_path / "log_ffp_asan_0.txt").write_text(self._CRASH)
+        logs = _categorize_logs(tmp_path)
+        assert _crashed_process_fields(logs, parent_pid=None)["crashed_parent"] is None

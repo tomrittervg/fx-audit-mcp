@@ -39,8 +39,27 @@ _IDLE_THRESHOLD = 15
 
 _USER_PREF_RE = re.compile(r'user_pref\(\s*"([^"]+)"')
 _ASAN_PID_RE = re.compile(r"==(\d+)==ERROR:")
+# One whole ChildProcessLifecycle record, anchored at the start of its line.
+#
+# Anchoring and the wrapper allowlist are hardening, NOT a boundary. MOZ_LOG
+# applies no escaping to a console message, so a newline inside page-authored
+# text puts the remainder of that text at column 0 -- real examples sit in the
+# reference corpus, where a JavaScript warning's stack frames each start a
+# line. A page can therefore emit a line that looks exactly like a lifecycle
+# record. See _extract_parent_pids and _extract_child_ptypes for the two
+# corroborations that close the reachable attacks, and the module docstring
+# for the residual risk.
+#
+# The three permitted prefixes are the harness's own wrappers, measured across
+# 7472 real records: bare, the `[pid=N] ` form this repo's own Felt
+# demultiplexer emits, and the Felt console re-emitting the spawned browser.
+#
+# `[^\]]*` for the type rather than `.*`, which ran to the last `]` on the
+# line.
 _CHILD_LAUNCH_RE = re.compile(
-    r"\+\+PROCESS \[pid = (\d+)\] \[childID = \d+\] \[type = (.*)\]"
+    r'(?:\[pid=\d+\] )?(?:console\.error: FeltBrowser: "\[\d+\]: )?'
+    r"\[Parent (\d+): [^\]]*\]: I/ChildProcessLifecycle "
+    r"(\+\+|--)PROCESS \[pid = (\d+)\] \[childID = \d+\] \[type = ([^\]]*)\]"
 )
 _PTYPE_TO_FIELD_MAP: dict[str, str] = {
     "tab": "crashed_content",
@@ -139,22 +158,93 @@ def _extract_crash_pids(log_paths: list[str]) -> list[int]:
 def _extract_child_ptypes(log_paths: list[str]) -> dict[int, str]:
     """Map each launched child PID to its GeckoProcessType.
 
-    Reads the ChildProcessLifecycle log the parent writes to stderr (enabled
-    via the MOZ_LOG modules set by browser_evaluator). A PID that carries no
-    launch record is absent from the mapping - the parent is never launched as
-    a child, and a record is missing when the parent died before flushing it.
+    Reads the ChildProcessLifecycle records the parent emits (enabled via the
+    MOZ_LOG modules the evaluators set). A PID that carries no launch record
+    is absent from the mapping - the parent is never launched as a child, and
+    a record is missing when the parent died before flushing it.
 
     Args:
-        log_paths: Paths of the stderr logs captured during the run.
+        log_paths: Paths of the logs captured during the run. Pass every
+            stream: Gecko routes these through MOZ_LOG; whichever stream the
+            harness captured them on, both are scanned.
 
     Returns:
         Mapping of child PID to process type (e.g. "tab", "gpu"). A PID can be
         reused, so the last launch wins.
     """
+    types: dict[int, str] = {}
+    live: set[int] = set()
+    for line in _scan_lines(log_paths):
+        match = _CHILD_LAUNCH_RE.match(line)
+        if not match:
+            continue
+        pid = int(match.group(3))
+        if match.group(2) == "--":
+            live.discard(pid)
+            continue
+        # A pid is only (re)typed while it is not already live. Genuine reuse
+        # is preceded by the --PROCESS record for the previous occupant, so
+        # it still wins; a second ++PROCESS for a pid with no exit in between
+        # does not. Plain last-wins let page-authored text, which can only be
+        # appended after the genuine record, retype the page's own pid to a
+        # flagless type ("vr") and turn a real content crash into "crashed in
+        # none of these processes".
+        if pid not in live:
+            types[pid] = match.group(4)
+            live.add(pid)
+    return types
+
+
+_LOG_CHILD_PREFIX_RE = re.compile(r"^(?:\[pid=\d+\] )?\[Child (\d+):")
+
+
+def _extract_child_prefix_pids(log_paths: list[str]) -> set[int]:
+    """PIDs that ever logged under a `[Child N:` MOZ_LOG prefix.
+
+    A Firefox parent never logs as `Child`, so this set can only contain
+    child processes. It is used to reject a forged parent: page-authored text
+    can start a line (MOZ_LOG does not escape console messages), but the
+    message carrying the forgery is itself emitted by the page's own content
+    process, which has logged as `Child` -- so a page cannot nominate itself
+    as a parent without contradicting its own prefix.
+
+    Measured over 324 corpus directories: zero overlap between launch-record
+    parent pids and `[Child N:` prefix pids, so this costs no real
+    attribution.
+
+    Args:
+        log_paths: Paths of the logs captured during the run.
+
+    Returns:
+        The set of PIDs seen under a child prefix.
+    """
     return {
-        int(match.group(1)): match.group(2)
+        int(match.group(1))
         for line in _scan_lines(log_paths)
-        for match in _CHILD_LAUNCH_RE.finditer(line)
+        if (match := _LOG_CHILD_PREFIX_RE.match(line))
+    }
+
+
+def _extract_parent_pids(log_paths: list[str]) -> set[int]:
+    """PIDs that emitted a ChildProcessLifecycle record, i.e. are parents.
+
+    A single run's logs can contain more than one Firefox parent: the Felt
+    evaluator launches the sign-in UI, and the browser under test is a second
+    parent spawned by it. Taking the pid from the MOZ_LOG prefix of each
+    launch record identifies every one of them, including the parent the
+    harness never held a handle to.
+
+    Args:
+        log_paths: Paths of the logs captured during the run.
+
+    Returns:
+        The set of parent PIDs seen. Empty when the logs carry no launch
+        records, which leaves attribution exactly as unresolved as before.
+    """
+    return {
+        int(match.group(1))
+        for line in _scan_lines(log_paths)
+        if (match := _CHILD_LAUNCH_RE.match(line))
     }
 
 
@@ -166,8 +256,12 @@ def _crashed_process_fields(
     Args:
         log_paths: Log files captured for the crash. The ASAN PIDs are read
             from the crashdata logs and resolved against the
-            ChildProcessLifecycle records in the stderr logs.
-        parent_pid: PID of the Firefox parent process, or None if unknown.
+            ChildProcessLifecycle records, which Gecko routes through MOZ_LOG
+            onto stdout -- both streams are scanned, because the stderr logs
+            are empty in every Felt session and attribution read only those.
+        parent_pid: PID of the Firefox parent process, or None when the caller
+            does not know it. Parents are also recovered from the logs, so
+            None no longer means parent crashes go unattributed.
 
     Returns:
         The BrowserCrashInfo process flags. Multiple processes can crash in a
@@ -176,7 +270,10 @@ def _crashed_process_fields(
         once every crashing PID has been attributed: any PID that is neither
         the parent nor carries a launch record in stderr leaves the
         unidentified child flags None, so an unresolved crash is not reported
-        as having happened in none of these processes. When crashdata carries
+        as having happened in none of these processes -- and leaves
+        crashed_parent None too when the parent set was inferred from the
+        logs rather than supplied, since the unplaced pid may be a parent
+        whose own launch record was never written. When crashdata carries
         no ASAN PID marker at all, every flag is None.
     """
     crash_pids = _extract_crash_pids(log_paths.crashdata)
@@ -189,9 +286,32 @@ def _crashed_process_fields(
     if parent_pid is None:
         pfields["crashed_parent"] = None
 
-    child_ptypes = _extract_child_ptypes(log_paths.stderr)
+    # Both streams: ChildProcessLifecycle goes through MOZ_LOG, which this
+    # harness captures on stdout. Reading stderr alone left crashed_parent
+    # null in all 1,601
+    # results of one 183-target batch -- the crash was detected, the process
+    # never identified.
+    # The harness's own derived logs are excluded: log_stdout_requests.txt is
+    # a verbatim transcript of attacker-chosen request lines, and
+    # log_stdout_session.txt echoes caller-supplied strings.
+    lifecycle_logs = [
+        path
+        for path in (*log_paths.stdout, *log_paths.stderr)
+        if not path.endswith(("_requests.txt", "_session.txt"))
+    ]
+    child_ptypes = _extract_child_ptypes(lifecycle_logs)
+    # A pid that logged as Child is not a parent, whatever a launch record
+    # claims. This is what stops a page promoting its own content crash to a
+    # parent crash, since anchoring alone cannot (see _CHILD_LAUNCH_RE).
+    parent_pids = _extract_parent_pids(lifecycle_logs) - _extract_child_prefix_pids(
+        lifecycle_logs
+    )
+    if parent_pid is not None:
+        parent_pids.add(parent_pid)
+    if parent_pids:
+        pfields["crashed_parent"] = False
     for crash_pid in crash_pids:
-        if crash_pid == parent_pid:
+        if crash_pid in parent_pids:
             pfields["crashed_parent"] = True
             continue
 
@@ -209,6 +329,15 @@ def _crashed_process_fields(
         # the other child flags to None rather than ruling them out.
         for pfield_name in _PTYPE_TO_FIELD_MAP.values():
             pfields[pfield_name] = pfields[pfield_name] or None
+        # And the parent flag too, when the parent set was *inferred* from the
+        # logs rather than supplied by the caller. An unidentified pid may be
+        # a parent whose own launch record never got written -- a browser that
+        # died during startup emits none. Saying False there would be a
+        # confident negative about the one pid this function just admitted it
+        # cannot place. A caller-supplied parent_pid is authoritative, so the
+        # negative stands in that case.
+        if parent_pid is None:
+            pfields["crashed_parent"] = pfields["crashed_parent"] or None
 
     return pfields
 
