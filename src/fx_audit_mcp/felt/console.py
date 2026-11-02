@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-from .console_patch import DLP_WASM_ENV, POLICIES_ENV, PREFS_ENV
+from .console_patch import ACCOUNT_ENV, DLP_WASM_ENV, POLICIES_ENV, PREFS_ENV
 
 LAUNCHER = Path(__file__).with_name("console_launcher.py")
 # Generous on purpose, but not for the reason first assumed. `mach python` does
@@ -75,12 +75,14 @@ class FeltConsole:
         extra_prefs: Mapping[str, object] | None = None,
         extra_policies: Mapping[str, object] | None = None,
         dlp_wasm: Path | None = None,
+        account: Mapping[str, object] | None = None,
     ):
         self._root = Path(firefox_root)
         self._log_path = log_path
         self._extra_prefs = dict(extra_prefs or {})
         self._extra_policies = dict(extra_policies or {})
         self._dlp_wasm = dlp_wasm
+        self._account = dict(account or {})
         self._proc: subprocess.Popen[bytes] | None = None
         self._tmp: TemporaryDirectory[str] | None = None
         self.endpoints: ConsoleEndpoints | None = None
@@ -126,6 +128,7 @@ class FeltConsole:
                 # failure this delivery path exists to fix.
                 PREFS_ENV: json.dumps(self._extra_prefs),
                 POLICIES_ENV: json.dumps(self._extra_policies),
+                ACCOUNT_ENV: json.dumps(self._account),
                 **({DLP_WASM_ENV: str(self._dlp_wasm)} if self._dlp_wasm else {}),
             },
             stdout=subprocess.DEVNULL,

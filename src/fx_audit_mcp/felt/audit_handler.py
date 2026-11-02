@@ -6,7 +6,13 @@ checkout's `mach python` -- `console_launcher` is the only importer. The
 decisions it makes live in `console_patch`, which is importable anywhere and
 carries the tests.
 
-Two additions, both of which the stock handler cannot express:
+Four additions, none of which the stock handler can express:
+
+- `/api/browser/account`, which the stock console does not implement at all:
+  `ConsoleClient._paths` declares ten endpoints and `felt_tests.py` answers
+  eight. Without it `getFxAccountData()` rejects and every target behind
+  account or Sync state dead-ends -- four did in one batch, and the only run
+  that reached that surface got there by patching this console itself.
 
 - `/api/browser/content-analysis-wasm/...`, which the stock console answers
   with 404. `WasmModuleBackend` then has nothing to fetch, so the whole DLP
@@ -30,16 +36,20 @@ pickled if the start method is forkserver or spawn.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from console_patch import (  # type: ignore[import-not-found]
+    ACCOUNT_ENV,
     DLP_WASM_ENV,
     POLICIES_ENV,
     PREFS_ENV,
+    build_account_response,
     inject_extra_policies,
     inject_extra_prefs,
     parse_prefs_env,
+    wants_account,
     wants_config,
     wants_dlp_wasm,
     wants_policies,
@@ -56,6 +66,13 @@ class AuditConsoleHandler(ConsoleHttpHandler):  # type: ignore[misc]
             self._serve_dlp_wasm()
             return
         super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's dispatch name
+        """Serve the FxA account endpoint; delegate everything else."""
+        if wants_account(self.path):
+            self._serve_account()
+            return
+        super().do_POST()
 
     def reply(
         self,
@@ -81,6 +98,47 @@ class AuditConsoleHandler(ConsoleHttpHandler):  # type: ignore[misc]
                     payload, parse_prefs_env(os.environ.get(POLICIES_ENV))
                 )
         super().reply(payload, code, status, contentType)
+
+    def _serve_account(self) -> None:
+        """Answer the account fetch with the run's FxA account data.
+
+        Authenticated: `getFxAccountData` posts it with a bearer token, and
+        the authenticated stock endpoints check it the same way. (Not all of
+        them do -- `/api/browser/config` and the token endpoint do not -- but
+        an account payload is the kind that should.)
+
+        The body is read whether or not it parses. That is hygiene rather
+        than a live requirement today: the fork's handler never raises
+        `protocol_version`, so it stays HTTP/1.0 and closes every connection,
+        and an unread body cannot desynchronise a next request that does not
+        exist. It matters if that is ever raised to HTTP/1.1 -- note the
+        `check_auth` rejection path returns without reading, so the handler
+        would need revisiting as a whole rather than just here.
+        """
+        if not self.check_auth():
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        device_id = None
+        if raw_body:
+            # A body this does not understand is not fatal: device_id is an
+            # optimisation (the browser only sends it once it has one), and
+            # failing the whole request over it would reintroduce the 404.
+            try:
+                posted = json.loads(raw_body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                posted = None
+            if isinstance(posted, dict):
+                candidate = posted.get("device_id")
+                if isinstance(candidate, str) and candidate:
+                    device_id = candidate
+        self.reply(
+            build_account_response(os.environ.get(ACCOUNT_ENV), device_id),
+            contentType="application/json",
+        )
 
     def _serve_dlp_wasm(self) -> None:
         """Answer the module fetch with the configured WebAssembly bytes.

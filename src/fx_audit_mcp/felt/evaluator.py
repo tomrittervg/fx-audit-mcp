@@ -421,6 +421,7 @@ async def felt_browser_evaluator(  # pragma: no cover
     prefs: dict[str, str | int | bool] | None = None,
     policies: dict[str, object] | None = None,
     dlp_wasm: Path | None = None,
+    account: dict[str, object] | None = None,
     enable_sandbox: bool = False,
     attacker_process: Literal["spawned", "felt_ui"] = "spawned",
 ) -> BrowserCrashInfo:
@@ -524,6 +525,22 @@ async def felt_browser_evaluator(  # pragma: no cover
             `FeltWindowChild` additionally requires the SSO-callback URL
             match -- note that pattern drops the port, so the console host at
             any port satisfies it.
+        account: FxA account fields overriding the console's default signed-in
+            account, as returned by `/api/browser/account`. That endpoint is
+            ours, not the fork's: `ConsoleClient` declares ten console
+            endpoints and the fork's mock console implements eight, so
+            without it `getFxAccountData()` rejects and every target behind
+            account or Sync state dead-ends.
+
+            The default fixture carries `uid`, `email` and `verified`,
+            which is enough for the account to exist. It deliberately carries
+            no `sessionToken` and no `scopedKeys`: the console serves none of
+            `/api/fxa/*`, so either one would trade a clean failure for a
+            browser that believes it holds a session or keys it cannot use.
+            A target needing real Sync crypto must supply its own here and
+            record it with the finding -- and treat a result that depends on
+            fabricated credentials as unproven, since a real console would
+            not have issued them.
         enable_sandbox: Leave the sandbox enabled in the spawned browser. Same
             name, type and default as `browser_evaluator`'s, and the same
             seven `MOZ_DISABLE_*_SANDBOX` variables, so a testcase moves
@@ -626,6 +643,7 @@ async def felt_browser_evaluator(  # pragma: no cover
         extra_prefs=prefs or {},
         extra_policies=policies or {},
         dlp_wasm=wasm,
+        account=account or {},
     )
     server = _TestcaseServer(testcase_dir, log_dir / "log_stdout_requests.txt")
     proc: subprocess.Popen[bytes] | None = None
@@ -817,6 +835,7 @@ async def felt_browser_evaluator(  # pragma: no cover
         f"extra_prefs: {sorted((prefs or {}).items())}\n"
         f"extra_policies: {sorted(policies or {})}\n"
         f"dlp_wasm_served: {wasm}\n"
+        f"account_overrides: {sorted((account or {}).items())}\n"
         f"enable_sandbox: {enable_sandbox}\n"
         f"attacker_process: {attacker_process}\n"
         "note: remote_type is the spawned browser's selectedBrowser.remoteType\n"

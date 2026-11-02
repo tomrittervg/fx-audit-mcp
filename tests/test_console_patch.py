@@ -8,11 +8,16 @@ be got wrong is here.
 import json
 
 from fx_audit_mcp.felt.console_patch import (
+    ACCOUNT_EMAIL,
+    ACCOUNT_PATH,
+    ACCOUNT_UID,
     CONFIG_PATH,
     POLICIES_PATH,
+    build_account_response,
     inject_extra_policies,
     inject_extra_prefs,
     parse_prefs_env,
+    wants_account,
     wants_config,
     wants_dlp_wasm,
     wants_policies,
@@ -140,3 +145,94 @@ class TestPolicyPathMatching:
         """reply() dispatches on these two; an overlap would inject the wrong body."""
         assert not wants_config(POLICIES_PATH)
         assert not wants_policies(CONFIG_PATH)
+
+
+class TestAccountPathMatching:
+    """wants_account, which gates the endpoint the fork never implemented."""
+
+    def test_matches_the_account_path(self) -> None:
+        assert wants_account(ACCOUNT_PATH)
+
+    def test_ignores_the_query_string(self) -> None:
+        assert wants_account(f"{ACCOUNT_PATH}?device_id=abc")
+
+    def test_rejects_siblings_and_prefixes(self) -> None:
+        assert not wants_account(CONFIG_PATH)
+        assert not wants_account(POLICIES_PATH)
+        # A prefix match would swallow endpoints the fork does implement.
+        assert not wants_account(f"{ACCOUNT_PATH}/devices")
+
+
+class TestBuildAccountResponse:
+    """The payload EnterpriseStorageManager caches for the whole session."""
+
+    def test_carries_the_fields_fxa_requires(self) -> None:
+        """`uid` is load-bearing: without it updateAccountData throws."""
+        doc = json.loads(build_account_response(None))
+        assert doc["uid"] == ACCOUNT_UID
+        assert doc["email"] == ACCOUNT_EMAIL
+        assert doc["verified"] is True
+
+    def test_ships_no_session_token(self) -> None:
+        """`hasLocalSession()` is `!!data.sessionToken`.
+
+        Supplying one makes the browser claim an FxA session it does not
+        have and start fetching profile, session-status and device
+        registration from a console that serves none of `/api/fxa/*` -- a
+        worse failure than the 404 this route replaced.
+        """
+        assert "sessionToken" not in json.loads(build_account_response(None))
+
+    def test_uid_is_stable_across_processes(self) -> None:
+        """A findings artifact is a reproduction recipe; this must not drift.
+
+        Compares against the literal, not against `ACCOUNT_UID`: the
+        self-referential form passes even if the constant becomes
+        `uuid4().hex`, which is the regression that matters.
+        """
+        assert ACCOUNT_UID == "a0b1c2d3e4f5061728394a5b6c7d8e9f"
+        assert len(ACCOUNT_UID) == 32
+        assert build_account_response(None) == build_account_response(None)
+
+    def test_constants_match_the_product_and_the_console(self) -> None:
+        """Pinned against the other side, not against themselves.
+
+        `ACCOUNT_PATH` must equal `ConsoleClient._paths.FXACCOUNT`, and
+        `ACCOUNT_EMAIL` must equal the address `felt_tests.py` hardcodes in
+        `/sso/callback` and `/api/browser/whoami`. Asserting
+        `wants_account(ACCOUNT_PATH)` cannot see a typo in either; this can.
+        """
+        assert ACCOUNT_PATH == "/api/browser/account"
+        assert ACCOUNT_EMAIL == "nobody@mozilla.org"
+
+    def test_echoes_the_posted_device_id(self) -> None:
+        doc = json.loads(build_account_response(None, device_id="dev-7"))
+        assert doc["device"] == {"id": "dev-7"}
+
+    def test_absent_device_id_adds_no_device(self) -> None:
+        assert "device" not in json.loads(build_account_response(None))
+        assert "device" not in json.loads(build_account_response(None, device_id=""))
+
+    def test_caller_overrides_win_including_uid(self) -> None:
+        """A run that needs a specific account must be able to state one."""
+        raw = json.dumps({"uid": "f" * 32, "email": "her@example.invalid"})
+        doc = json.loads(build_account_response(raw))
+        assert doc["uid"] == "f" * 32
+        assert doc["email"] == "her@example.invalid"
+        # Unmentioned fixture fields survive.
+        assert doc["verified"] is True
+
+    def test_caller_device_beats_the_posted_id(self) -> None:
+        raw = json.dumps({"device": {"id": "chosen"}})
+        doc = json.loads(build_account_response(raw, device_id="posted"))
+        assert doc["device"] == {"id": "chosen"}
+
+    def test_malformed_override_falls_back_to_the_fixture(self) -> None:
+        """A 500 mid-handshake is worse than ignoring an unusable value."""
+        for raw in ("not json", "[1,2]", ""):
+            assert json.loads(build_account_response(raw))["uid"] == ACCOUNT_UID
+
+    def test_ships_no_sync_keys(self) -> None:
+        """Documented limit: invented key material that cannot decrypt is
+        worse than none, so a Sync target must supply its own."""
+        assert "scopedKeys" not in json.loads(build_account_response(None))

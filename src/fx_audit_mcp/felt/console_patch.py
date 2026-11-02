@@ -37,6 +37,28 @@ DLP_WASM_PREFIX = "/api/browser/content-analysis-wasm/"
 # target gated on one of those is unreachable through the stock console.
 POLICIES_PATH = "/api/browser/policies"
 
+# The console endpoint carrying FxA account data, which the fork's own mock
+# console does not implement at all: `ConsoleClient._paths` declares ten
+# endpoints and `felt_tests.py` answers eight, 404ing this one and the DLP
+# module fetch that AuditConsoleHandler also adds. The 404 makes
+# `ConsoleClient.getFxAccountData()` reject, so
+# `EnterpriseStorageManager.getAccountData()` catches and returns null and
+# logs "Critical! We're not signed into the console?" -- 10150 times across
+# one 183-target batch. Any target behind account or Sync state is
+# unreachable until this answers.
+ACCOUNT_PATH = "/api/browser/account"
+
+# The identity the fork's own console reports. `felt_tests.py` hardcodes this
+# in both places that report one -- /sso/callback and /api/browser/whoami --
+# and ignores whatever address was typed into the sign-in form. Matching it
+# keeps FxA describing the same user the session signed in as.
+ACCOUNT_EMAIL = "nobody@mozilla.org"
+
+# Fixed rather than random: an audit's whole output is a reproduction recipe,
+# and a uid that changes per process would make two runs of the same testcase
+# differ in a field findings may quote. 32 hex digits is the FxA shape.
+ACCOUNT_UID = "a0b1c2d3e4f5061728394a5b6c7d8e9f"
+
 # Env vars carrying per-run configuration to the handler. Env rather than
 # constructor arguments because the handler class is handed to
 # multiprocessing.Process: a fork start method would carry the values anyway,
@@ -45,6 +67,7 @@ POLICIES_PATH = "/api/browser/policies"
 PREFS_ENV = "FXE_AUDIT_EXTRA_PREFS"
 DLP_WASM_ENV = "FXE_AUDIT_DLP_WASM"
 POLICIES_ENV = "FXE_AUDIT_EXTRA_POLICIES"
+ACCOUNT_ENV = "FXE_AUDIT_ACCOUNT"
 
 
 def wants_config(path: str) -> bool:
@@ -60,6 +83,67 @@ def wants_dlp_wasm(path: str) -> bool:
 def wants_policies(path: str) -> bool:
     """Whether a request path is the enterprise policy endpoint."""
     return path.split("?", 1)[0] == POLICIES_PATH
+
+
+def wants_account(path: str) -> bool:
+    """Whether a request path is the FxA account endpoint."""
+    return path.split("?", 1)[0] == ACCOUNT_PATH
+
+
+def build_account_response(raw: str | None, device_id: str | None = None) -> str:
+    """The FxA account payload, as JSON.
+
+    Unlike the prefs and policies helpers this *constructs* a response rather
+    than rewriting one, because the fork's console has no response here to
+    rewrite. The shape is `FxAccountsStorageManager`'s account data, of which
+    `EnterpriseStorageManager` is a drop-in replacement: `uid` is the field
+    `updateAccountData` requires ("No user is logged in" without it), and
+    `email` and `verified` are plaintext fields `FXA_PWDMGR_PLAINTEXT_FIELDS`
+    names. `verified: true` matters: with it false, `startVerifiedCheck` polls
+    `checkEmailStatus` against a console that does not serve it.
+
+    **This unblocks account state; it is not a signed-in FxA session.**
+
+    No `sessionToken`, deliberately. It is one of the plaintext fields, but
+    nothing in `EnterpriseStorageManager` reads it and it is the single field
+    that arms the rest of FxA: `hasLocalSession()` is literally
+    `!!data.sessionToken`, and `getSignedInUser()` issues a profile fetch when
+    it is present. `EnterpriseEndpoints` re-homes the FxA endpoints onto the
+    console, which serves none of `/api/fxa/*`, so supplying one would trade a
+    clean 404 for a browser that claims a session it does not have and 404s
+    on profile, session-status and device registration instead. Omitting it
+    leaves `hasLocalSession()` false, which is the honest state.
+
+    No `scopedKeys` either, for the same reason in the other direction:
+    invented key material that cannot decrypt is worse than none.
+
+    A caller that genuinely needs either can supply it through `ACCOUNT_ENV`
+    -- and should say so in its finding, because fabricated credentials are
+    the console returning something a real console would not.
+
+    Args:
+        raw: JSON object from `ACCOUNT_ENV` overriding or extending the
+            fixture, or None. Caller-supplied keys win, including `uid`, so a
+            run that needs a specific account can state one.
+        device_id: The `device_id` the browser posted, echoed back as
+            `device.id` when the caller did not supply a `device` of its own.
+            `updateAccountData` mirrors that field into
+            `ENTERPRISE_DEVICE_ID_PREF`, which is where the next request's
+            `device_id` comes from.
+
+    Returns:
+        The response body.
+    """
+    account: dict[str, object] = {
+        "uid": ACCOUNT_UID,
+        "email": ACCOUNT_EMAIL,
+        "verified": True,
+    }
+    overrides = parse_prefs_env(raw)
+    account.update(overrides)
+    if device_id and "device" not in overrides:
+        account["device"] = {"id": device_id}
+    return json.dumps(account)
 
 
 def inject_extra_policies(payload: str, policies: Mapping[str, object]) -> str:
